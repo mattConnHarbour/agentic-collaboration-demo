@@ -9,7 +9,39 @@ import sampleDocument from '/sample-document.docx?url';
 const backendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3050';
 const wsUrl = backendUrl.replace(/^http/, 'ws');
 const COLLAB_URL = `${wsUrl}/collaboration`;
-const DOCUMENT_ID = 'superdoc-demo';
+
+// Room ID generation
+const ADJECTIVES = ['swift', 'brave', 'clever', 'mighty', 'gentle', 'fierce', 'calm', 'bold', 'wise', 'quick'];
+const ANIMALS = ['fox', 'owl', 'bear', 'wolf', 'eagle', 'tiger', 'otter', 'raven', 'falcon', 'panda'];
+
+const generateRoomId = () => {
+  const adj = ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)];
+  const animal = ANIMALS[Math.floor(Math.random() * ANIMALS.length)];
+  const num = String(Math.floor(Math.random() * 1000)).padStart(3, '0');
+  return `${adj}-${animal}-${num}`;
+};
+
+const getOrCreateRoomId = () => {
+  const params = new URLSearchParams(window.location.search);
+  const roomParam = params.get('room');
+
+  if (roomParam) {
+    return roomParam;
+  }
+
+  // Generate a random room ID
+  const newRoomId = generateRoomId();
+
+  // Update URL without reload
+  const url = new URL(window.location.href);
+  url.searchParams.set('room', newRoomId);
+  window.history.replaceState({}, '', url.toString());
+
+  return newRoomId;
+};
+
+const roomId = ref(getOrCreateRoomId());
+const roomCopied = ref(false);
 
 // Generate a unique session ID for this browser session
 const SESSION_ID = crypto.randomUUID();
@@ -41,14 +73,14 @@ const hashToColor = (str) => {
 const toolColor = (name) => ({ backgroundColor: hashToColor(name) });
 
 const initSuperDoc = () => {
-  console.log('[Client] Initializing SuperDoc');
+  console.log('[Client] Initializing SuperDoc for room:', roomId.value);
 
   superdoc.value = new SuperDoc({
     selector: '#superdoc',
     toolbar: '#superdoc-toolbar',
     toolbarGroups: ['center'],
     document: {
-      id: DOCUMENT_ID,
+      id: roomId.value,
       type: 'docx',
       url: sampleDocument,
     },
@@ -141,7 +173,7 @@ const sendMessage = async (content) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         sessionId: SESSION_ID,
-        documentId: DOCUMENT_ID,
+        documentId: roomId.value,
         prompt: text,
       }),
     });
@@ -249,6 +281,17 @@ const handleExport = async () => {
   }
 };
 
+const copyRoomId = async () => {
+  try {
+    await navigator.clipboard.writeText(window.location.href);
+    roomCopied.value = true;
+    setTimeout(() => { roomCopied.value = false; }, 1500);
+    console.log('[Client] Room URL copied:', window.location.href);
+  } catch (e) {
+    console.error('[Client] Copy failed:', e);
+  }
+};
+
 onMounted(() => {
   initSuperDoc();
 });
@@ -268,6 +311,9 @@ onBeforeUnmount(() => {
         <span class="logo-text">SuperDoc</span>
       </div>
       <div class="header-actions">
+        <button class="header-btn with-text" @click="copyRoomId" title="Click to copy room ID">
+          <span>{{ roomCopied ? 'Copied!' : `room: ${roomId}` }}</span>
+        </button>
         <input
           type="file"
           ref="fileInput"
