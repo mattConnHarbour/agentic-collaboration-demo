@@ -51,7 +51,7 @@ const superdoc = shallowRef(null);
 // Chat state
 const chatMessages = ref([]);
 const chatInput = ref('');
-const agentStatus = ref('ready');
+const agentStatus = ref('disconnected');
 const currentToolCalls = ref([]);
 const chatContainer = ref(null);
 
@@ -273,7 +273,7 @@ const handleExport = async () => {
   try {
     const now = new Date();
     const pad = (n) => String(n).padStart(2, '0');
-    const filename = `SuperDoc-${pad(now.getMonth() + 1)}:${pad(now.getDate())}:${String(now.getFullYear()).slice(-2)}-${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+    const filename = `SuperDoc_${pad(now.getMonth() + 1)}-${pad(now.getDate())}-${String(now.getFullYear()).slice(-2)}`;
     await superdoc.value.export({ exportedName: filename });
     console.log('[Client] Document exported:', filename);
   } catch (e) {
@@ -292,8 +292,26 @@ const copyRoomId = async () => {
   }
 };
 
+const checkBackendHealth = async () => {
+  try {
+    const response = await fetch(`${backendUrl}/health`);
+    const data = await response.json();
+    if (data.status === 'ok') {
+      agentStatus.value = 'ready';
+      console.log('[Client] Backend connected');
+    } else {
+      agentStatus.value = 'disconnected';
+      console.error('[Client] Backend unhealthy:', data);
+    }
+  } catch (e) {
+    agentStatus.value = 'disconnected';
+    console.error('[Client] Backend unreachable:', e);
+  }
+};
+
 onMounted(() => {
   initSuperDoc();
+  checkBackendHealth();
 });
 
 onBeforeUnmount(() => {
@@ -355,7 +373,7 @@ onBeforeUnmount(() => {
           </div>
           <div class="agent-status" :class="agentStatus">
             <span class="status-dot"></span>
-            <span>{{ agentStatus === 'thinking' ? 'Thinking...' : agentStatus === 'working' ? 'Working...' : agentStatus === 'ready' ? 'Ready' : 'Offline' }}</span>
+            <span>{{ agentStatus === 'thinking' ? 'Thinking...' : agentStatus === 'working' ? 'Working...' : agentStatus === 'ready' ? 'Ready' : agentStatus === 'disconnected' ? 'Disconnected' : 'Offline' }}</span>
           </div>
         </div>
 
@@ -647,6 +665,10 @@ body {
 .agent-status.working .status-dot {
   background: #3b82f6;
   animation: pulse 1.5s ease-in-out infinite;
+}
+
+.agent-status.disconnected .status-dot {
+  background: #ef4444;
 }
 
 @keyframes pulse {

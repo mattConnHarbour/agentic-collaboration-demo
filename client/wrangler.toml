@@ -1,0 +1,5 @@
+name = "agentic-collaboration-demo"
+pages_build_output_dir = "dist"
+
+[vars]
+VITE_BACKEND_URL = "https://backend-production-370a.up.railway.app"
