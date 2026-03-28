@@ -1,7 +1,10 @@
+import dotenv from 'dotenv';
+dotenv.config({ path: '../.env' });
+
 import Fastify from 'fastify';
+import cors from '@fastify/cors';
 import websocketPlugin from '@fastify/websocket';
 import { Doc as YDoc, encodeStateAsUpdate } from 'yjs';
-import type { WebSocket } from 'ws';
 
 import {
   CollaborationBuilder,
@@ -10,38 +13,24 @@ import {
   type ServiceConfig
 } from '@superdoc-dev/superdoc-yjs-collaboration';
 
+import { Agent } from './agent.js';
+import { Job } from './job.js';
+
 // ============================================================================
-// Chat Types
+// Agent Registry
 // ============================================================================
 
-interface ChatMessage {
-  id: string;
-  role: 'user' | 'assistant';
-  content: string;
-  timestamp: number;
-}
+const agents = new Map<string, Agent>();
 
-interface ChatRoom {
-  messages: ChatMessage[];
-  clients: Set<WebSocket>;
-  agentStatus: string;
-}
-
-const chatRooms = new Map<string, ChatRoom>();
-
-function getChatRoom(roomId: string): ChatRoom {
-  if (!chatRooms.has(roomId)) {
-    chatRooms.set(roomId, { messages: [], clients: new Set(), agentStatus: 'offline' });
+async function getOrCreateAgent(sessionId: string, documentId: string, collaborationUrl: string): Promise<Agent> {
+  let agent = agents.get(sessionId);
+  if (!agent) {
+    agent = new Agent(documentId, collaborationUrl);
+    await agent.connect();
+    agents.set(sessionId, agent);
+    console.log(`[Server] Created agent for session: ${sessionId}`);
   }
-  return chatRooms.get(roomId)!;
-}
-
-function broadcastToRoom(roomId: string, data: object, exclude?: WebSocket) {
-  const room = getChatRoom(roomId);
-  const msg = JSON.stringify(data);
-  for (const client of room.clients) {
-    if (client !== exclude && client.readyState === 1) client.send(msg);
-  }
+  return agent;
 }
 
 // ============================================================================
@@ -82,12 +71,24 @@ const SuperDocCollaboration = new CollaborationBuilder()
 async function main() {
   const fastify = Fastify({ logger: false });
   const port = parseInt(process.env.PORT || '3050', 10);
+  const collaborationUrl = `ws://localhost:${port}/collaboration`;
 
-  // Register WebSocket plugin
+  // Register plugins
+  await fastify.register(cors, { origin: true });
   await fastify.register(websocketPlugin);
 
   // Health check
   fastify.get('/health', async () => ({ status: 'ok' }));
+
+  // Agent health check
+  fastify.get('/health/agent', async (request) => {
+    const sessionId = (request.query as { session?: string }).session;
+    if (sessionId) {
+      const agent = agents.get(sessionId);
+      return { status: agent ? 'connected' : 'not_found', session: sessionId };
+    }
+    return { status: 'ok', activeSessions: agents.size, activeJobs: Job.count };
+  });
 
   // Collaboration WebSocket
   fastify.get('/collaboration/:documentId', { websocket: true }, (socket, request) => {
@@ -96,47 +97,41 @@ async function main() {
     SuperDocCollaboration.welcome(socket as any, request as any);
   });
 
-  // Chat WebSocket
-  fastify.get('/chat/:roomId', { websocket: true }, (socket, request) => {
-    const roomId = (request.params as { roomId: string }).roomId;
-    const room = getChatRoom(roomId);
-    room.clients.add(socket);
-    console.log(`[Server] Chat client joined "${roomId}" (${room.clients.size} clients)`);
+  // ============================================================================
+  // Chat API (HTTP + Polling)
+  // ============================================================================
 
-    // Send current state
-    socket.send(JSON.stringify({ type: 'init', messages: room.messages, agentStatus: room.agentStatus }));
+  // Create a chat job
+  fastify.post('/chat', async (request) => {
+    const { sessionId, documentId, prompt } = request.body as {
+      sessionId: string;
+      documentId: string;
+      prompt: string;
+    };
 
-    socket.on('message', (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        console.log(`[Server] Chat ${msg.type} from ${msg.role || 'system'}:`, msg.content?.slice(0, 50) || '');
+    if (!sessionId || !documentId || !prompt) {
+      return { error: 'Missing required fields: sessionId, documentId, prompt' };
+    }
 
-        if (msg.type === 'message') {
-          const chatMsg: ChatMessage = {
-            id: msg.id || `${msg.role}-${Date.now()}`,
-            role: msg.role,
-            content: msg.content,
-            timestamp: msg.timestamp || Date.now()
-          };
-          room.messages.push(chatMsg);
-          console.log(`[Server] Broadcasting to ${room.clients.size - 1} other clients`);
-          broadcastToRoom(roomId, { type: 'message', message: chatMsg }, socket);
-        } else if (msg.type === 'status') {
-          room.agentStatus = msg.status;
-          broadcastToRoom(roomId, { type: 'status', status: msg.status }, socket);
-        } else if (msg.type === 'clear') {
-          room.messages = [];
-          broadcastToRoom(roomId, { type: 'clear' });
-        }
-      } catch (e) {
-        console.error('[Server] Chat parse error:', e);
-      }
-    });
+    const job = Job.create();
 
-    socket.on('close', () => {
-      room.clients.delete(socket);
-      console.log(`[Server] Chat client left "${roomId}" (${room.clients.size} clients)`);
-    });
+    // Fire and forget - process asynchronously
+    getOrCreateAgent(sessionId, documentId, collaborationUrl)
+      .then(agent => job.process(agent, prompt));
+
+    return { jobId: job.id };
+  });
+
+  // Poll for job result
+  fastify.get('/chat/jobs/:jobId', async (request) => {
+    const { jobId } = request.params as { jobId: string };
+    const job = Job.get(jobId);
+
+    if (!job) {
+      return { error: 'Job not found' };
+    }
+
+    return job.toJSON();
   });
 
   // Start server
@@ -145,7 +140,7 @@ async function main() {
   console.log('[Server] ' + '='.repeat(50));
   console.log(`[Server] Listening at http://0.0.0.0:${port}`);
   console.log(`[Server] Collaboration: ws://localhost:${port}/collaboration/:documentId`);
-  console.log(`[Server] Chat: ws://localhost:${port}/chat/:roomId`);
+  console.log(`[Server] Chat API: POST /chat, GET /chat/jobs/:jobId`);
   console.log('[Server] ' + '='.repeat(50));
 }
 

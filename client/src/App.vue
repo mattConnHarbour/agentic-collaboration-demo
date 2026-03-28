@@ -9,20 +9,36 @@ import sampleDocument from '/sample-document.docx?url';
 const backendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3050';
 const wsUrl = backendUrl.replace(/^http/, 'ws');
 const COLLAB_URL = `${wsUrl}/collaboration`;
-const CHAT_URL = `${wsUrl}/chat`;
 const DOCUMENT_ID = 'superdoc-demo';
 
+// Generate a unique session ID for this browser session
+const SESSION_ID = crypto.randomUUID();
+
 const superdoc = shallowRef(null);
-const chatWs = shallowRef(null);
 
 // Chat state
 const chatMessages = ref([]);
 const chatInput = ref('');
-const agentStatus = ref('offline');
+const agentStatus = ref('ready');
+const currentToolCalls = ref([]);
 const chatContainer = ref(null);
-const lastUserMessageTime = ref(null);
 
 const USER_COLORS = ['#a11134', '#2a7e34', '#b29d11', '#2f4597', '#ab5b22'];
+
+// Truncate text for logging
+const truncate = (text, max = 60) => text?.length > max ? text.slice(0, max) + '...' : text;
+
+// Hash string to consistent color
+const hashToColor = (str) => {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = str.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  const hue = Math.abs(hash) % 360;
+  return `hsl(${hue}, 60%, 90%)`;
+};
+
+const toolColor = (name) => ({ backgroundColor: hashToColor(name) });
 
 const initSuperDoc = () => {
   console.log('[Client] Initializing SuperDoc');
@@ -35,7 +51,6 @@ const initSuperDoc = () => {
       id: DOCUMENT_ID,
       type: 'docx',
       url: sampleDocument,
-      isNewFile: true,
     },
     layoutEngineOptions: {
       flowMode: 'semantic',
@@ -54,66 +69,115 @@ const initSuperDoc = () => {
   });
 };
 
-const initChat = () => {
-  const chatUrl = `${CHAT_URL}/${DOCUMENT_ID}`;
-  const ws = new WebSocket(chatUrl);
-  chatWs.value = ws;
+// Poll for job completion
+const pollForResult = async (jobId) => {
+  const pollInterval = 1000; // 1 second
+  const maxAttempts = 120; // 2 minutes max
 
-  ws.onopen = () => {
-    ws.send(JSON.stringify({ type: 'clear' }));
-  };
-
-  ws.onmessage = (event) => {
+  for (let i = 0; i < maxAttempts; i++) {
     try {
-      const data = JSON.parse(event.data);
-      if (data.type === 'init') {
-        chatMessages.value = data.messages || [];
-        agentStatus.value = data.agentStatus || 'offline';
-        scrollToBottom();
-      } else if (data.type === 'message') {
-        const msg = data.message;
-        if (msg.role === 'assistant' && lastUserMessageTime.value) {
-          msg.duration = Date.now() - lastUserMessageTime.value;
-          lastUserMessageTime.value = null;
-        }
-        chatMessages.value.push(msg);
-        scrollToBottom();
-      } else if (data.type === 'status') {
-        agentStatus.value = data.status;
-      } else if (data.type === 'clear') {
-        chatMessages.value = [];
+      const response = await fetch(`${backendUrl}/chat/jobs/${jobId}`);
+      const job = await response.json();
+
+      console.log(`[Chat] Poll #${i + 1}: ${job.status}${job.toolCalls?.length ? ` (${job.toolCalls.length} tools)` : ''}`);
+
+      // Update status based on job state
+      if (job.status === 'pending') {
+        agentStatus.value = 'thinking';
+      } else if (job.status === 'processing') {
+        agentStatus.value = 'working';
       }
+
+      // Update tool calls
+      if (job.toolCalls?.length) {
+        currentToolCalls.value = job.toolCalls;
+        scrollToBottom();
+      }
+
+      if (job.status === 'complete') {
+        console.log(`[Chat] Result: ${truncate(job.result)}`);
+        return { result: job.result, toolCalls: job.toolCalls || [] };
+      } else if (job.status === 'error') {
+        console.log(`[Chat] Error: ${truncate(job.error)}`);
+        throw new Error(job.error || 'Unknown error');
+      }
+
+      // Still processing, wait and try again
+      await new Promise(resolve => setTimeout(resolve, pollInterval));
     } catch (e) {
-      console.error('[Client] Failed to parse message:', e);
+      console.error('[Chat] Poll failed:', e);
+      throw e;
     }
-  };
-
-  ws.onclose = () => {
-    agentStatus.value = 'offline';
-  };
-};
-
-const sendMessage = (content) => {
-  const text = content || chatInput.value.trim();
-  if (!text || !chatWs.value) return;
-
-  if (chatWs.value.readyState !== WebSocket.OPEN) {
-    initChat();
-    return;
   }
 
-  const message = {
+  throw new Error('Request timed out');
+};
+
+const sendMessage = async (content) => {
+  const text = content || chatInput.value.trim();
+  if (!text || agentStatus.value === 'thinking') return;
+
+  // Add user message to chat
+  const userMessage = {
     id: `user-${Date.now()}`,
     role: 'user',
     content: text,
     timestamp: Date.now(),
   };
-
-  lastUserMessageTime.value = Date.now();
-  chatMessages.value.push(message);
-  chatWs.value.send(JSON.stringify({ type: 'message', ...message }));
+  chatMessages.value.push(userMessage);
   chatInput.value = '';
   scrollToBottom();
+
+  // Set status to thinking and clear tool calls
+  agentStatus.value = 'thinking';
+  currentToolCalls.value = [];
+
+  try {
+    console.log(`[Chat] Sending: ${truncate(text)}`);
+
+    // Submit chat job
+    const response = await fetch(`${backendUrl}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionId: SESSION_ID,
+        documentId: DOCUMENT_ID,
+        prompt: text,
+      }),
+    });
+
+    const { jobId, error } = await response.json();
+    if (error) throw new Error(error);
+
+    console.log(`[Chat] Job created: ${jobId}`);
+
+    // Poll for result
+    const { result, toolCalls } = await pollForResult(jobId);
+
+    // Add assistant message to chat
+    const assistantMessage = {
+      id: `assistant-${Date.now()}`,
+      role: 'assistant',
+      content: result,
+      toolCalls: toolCalls,
+      timestamp: Date.now(),
+    };
+    chatMessages.value.push(assistantMessage);
+    scrollToBottom();
+  } catch (e) {
+    console.error('[Client] Chat error:', e);
+    // Add error message to chat
+    chatMessages.value.push({
+      id: `error-${Date.now()}`,
+      role: 'assistant',
+      content: `Error: ${e.message}`,
+      timestamp: Date.now(),
+    });
+    scrollToBottom();
+  } finally {
+    agentStatus.value = 'ready';
+    currentToolCalls.value = [];
+  }
 };
 
 const handleKeydown = (event) => {
@@ -149,15 +213,49 @@ const formatTime = (timestamp) => {
   return new Date(timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 };
 
+// File input ref for import
+const fileInput = ref(null);
+
+const handleImport = () => {
+  fileInput.value?.click();
+};
+
+const onFileSelected = async (event) => {
+  const file = event.target.files?.[0];
+  if (!file || !superdoc.value) return;
+
+  try {
+    await superdoc.value.activeEditor.replaceFile(file);
+    console.log('[Client] Document imported:', file.name);
+  } catch (e) {
+    console.error('[Client] Import failed:', e);
+  }
+
+  // Reset input so same file can be selected again
+  event.target.value = '';
+};
+
+const handleExport = async () => {
+  if (!superdoc.value) return;
+
+  try {
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const filename = `SuperDoc-${pad(now.getMonth() + 1)}:${pad(now.getDate())}:${String(now.getFullYear()).slice(-2)}-${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+    await superdoc.value.export({ exportedName: filename });
+    console.log('[Client] Document exported:', filename);
+  } catch (e) {
+    console.error('[Client] Export failed:', e);
+  }
+};
+
 onMounted(() => {
   initSuperDoc();
-  initChat();
 });
 
 onBeforeUnmount(() => {
   superdoc.value?.destroy();
   superdoc.value = null;
-  chatWs.value?.close();
 });
 </script>
 
@@ -168,6 +266,26 @@ onBeforeUnmount(() => {
       <div class="logo">
         <img src="/logo.webp" alt="SuperDoc" class="logo-img" />
         <span class="logo-text">SuperDoc</span>
+      </div>
+      <div class="header-actions">
+        <input
+          type="file"
+          ref="fileInput"
+          @change="onFileSelected"
+          accept=".docx,.doc"
+          style="display: none"
+        />
+        <button class="header-btn with-text" @click="handleImport" title="Import">
+          <span>Import</span>
+          <svg viewBox="0 0 640 640" fill="currentColor">
+            <path d="M352 173.3L352 384C352 401.7 337.7 416 320 416C302.3 416 288 401.7 288 384L288 173.3L246.6 214.7C234.1 227.2 213.8 227.2 201.3 214.7C188.8 202.2 188.8 181.9 201.3 169.4L297.3 73.4C309.8 60.9 330.1 60.9 342.6 73.4L438.6 169.4C451.1 181.9 451.1 202.2 438.6 214.7C426.1 227.2 405.8 227.2 393.3 214.7L352 173.3zM320 464C364.2 464 400 428.2 400 384L480 384C515.3 384 544 412.7 544 448L544 480C544 515.3 515.3 544 480 544L160 544C124.7 544 96 515.3 96 480L96 448C96 412.7 124.7 384 160 384L240 384C240 428.2 275.8 464 320 464zM464 488C477.3 488 488 477.3 488 464C488 450.7 477.3 440 464 440C450.7 440 440 450.7 440 464C440 477.3 450.7 488 464 488z"/>
+          </svg>
+        </button>
+        <button class="header-btn" @click="handleExport" title="Export">
+          <svg viewBox="0 0 640 640" fill="currentColor">
+            <path d="M352 96C352 78.3 337.7 64 320 64C302.3 64 288 78.3 288 96L288 306.7L246.6 265.3C234.1 252.8 213.8 252.8 201.3 265.3C188.8 277.8 188.8 298.1 201.3 310.6L297.3 406.6C309.8 419.1 330.1 419.1 342.6 406.6L438.6 310.6C451.1 298.1 451.1 277.8 438.6 265.3C426.1 252.8 405.8 252.8 393.3 265.3L352 306.7L352 96zM160 384C124.7 384 96 412.7 96 448L96 480C96 515.3 124.7 544 160 544L480 544C515.3 544 544 515.3 544 480L544 448C544 412.7 515.3 384 480 384L433.1 384L376.5 440.6C345.3 471.8 294.6 471.8 263.4 440.6L206.9 384L160 384zM464 440C477.3 440 488 450.7 488 464C488 477.3 477.3 488 464 488C450.7 488 440 477.3 440 464C440 450.7 450.7 440 464 440z"/>
+          </svg>
+        </button>
       </div>
     </header>
 
@@ -191,7 +309,7 @@ onBeforeUnmount(() => {
           </div>
           <div class="agent-status" :class="agentStatus">
             <span class="status-dot"></span>
-            <span>{{ agentStatus === 'thinking' ? 'Thinking...' : agentStatus === 'ready' ? 'Ready' : 'Offline' }}</span>
+            <span>{{ agentStatus === 'thinking' ? 'Thinking...' : agentStatus === 'working' ? 'Working...' : agentStatus === 'ready' ? 'Ready' : 'Offline' }}</span>
           </div>
         </div>
 
@@ -204,10 +322,14 @@ onBeforeUnmount(() => {
             :class="msg.role"
           >
             <div class="message-avatar">
-              <div v-if="msg.role === 'user'" class="avatar user-avatar">U</div>
+              <div v-if="msg.role === 'user'" class="avatar user-avatar">
+                <svg viewBox="0 0 640 640" fill="currentColor">
+                  <path d="M320 312C386.3 312 440 258.3 440 192C440 125.7 386.3 72 320 72C253.7 72 200 125.7 200 192C200 258.3 253.7 312 320 312zM290.3 368C191.8 368 112 447.8 112 546.3C112 562.7 125.3 576 141.7 576L498.3 576C514.7 576 528 562.7 528 546.3C528 447.8 448.2 368 349.7 368L290.3 368z"/>
+                </svg>
+              </div>
               <div v-else class="avatar agent-avatar">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                <svg viewBox="0 0 640 640" fill="currentColor">
+                  <path d="M320 312C386.3 312 440 258.3 440 192C440 125.7 386.3 72 320 72C253.7 72 200 125.7 200 192C200 258.3 253.7 312 320 312zM290.3 368C191.8 368 112 447.8 112 546.3C112 562.7 125.3 576 141.7 576L498.3 576C514.7 576 528 562.7 528 546.3C528 447.8 448.2 368 349.7 368L290.3 368z"/>
                 </svg>
               </div>
             </div>
@@ -216,23 +338,34 @@ onBeforeUnmount(() => {
                 <span class="message-name">{{ msg.role === 'user' ? 'You' : 'Agent' }}</span>
                 <span class="message-time">{{ formatTime(msg.timestamp) }}</span>
               </div>
+              <div v-if="msg.toolCalls?.length" class="tool-calls">
+                <div v-for="(tool, idx) in msg.toolCalls" :key="idx" class="tool-call" :style="toolColor(tool.name)">
+                  {{ tool.name }}
+                </div>
+              </div>
               <div class="message-content">{{ msg.content }}</div>
             </div>
           </div>
 
-          <!-- Typing indicator -->
-          <div v-if="agentStatus === 'thinking'" class="chat-message assistant typing">
+          <!-- Status indicator -->
+          <div v-if="agentStatus === 'thinking' || agentStatus === 'working'" class="chat-message assistant typing">
             <div class="message-avatar">
               <div class="avatar agent-avatar">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                <svg viewBox="0 0 640 640" fill="currentColor">
+                  <path d="M320 312C386.3 312 440 258.3 440 192C440 125.7 386.3 72 320 72C253.7 72 200 125.7 200 192C200 258.3 253.7 312 320 312zM290.3 368C191.8 368 112 447.8 112 546.3C112 562.7 125.3 576 141.7 576L498.3 576C514.7 576 528 562.7 528 546.3C528 447.8 448.2 368 349.7 368L290.3 368z"/>
                 </svg>
               </div>
             </div>
             <div class="message-body">
               <div class="message-header">
                 <span class="message-name">Agent</span>
-                <span class="typing-indicator">is typing...</span>
+                <span class="typing-indicator">{{ agentStatus === 'thinking' ? 'thinking...' : 'working...' }}</span>
+              </div>
+              <!-- Tool calls -->
+              <div v-if="currentToolCalls.length" class="tool-calls">
+                <div v-for="(tool, idx) in currentToolCalls" :key="idx" class="tool-call" :style="toolColor(tool.name)">
+                  {{ tool.name }}
+                </div>
               </div>
             </div>
           </div>
@@ -245,12 +378,12 @@ onBeforeUnmount(() => {
             v-model="chatInput"
             @keydown="handleKeydown"
             placeholder="Ask the agent..."
-            :disabled="agentStatus === 'thinking'"
+            :disabled="agentStatus !== 'ready'"
           />
           <button
             class="send-btn"
             @click="sendMessage()"
-            :disabled="!chatInput.trim() || agentStatus === 'thinking'"
+            :disabled="!chatInput.trim() || agentStatus !== 'ready'"
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
@@ -285,10 +418,49 @@ body {
 .top-header {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   padding: 12px 24px;
   background: #fff;
   border-bottom: 1px solid #e5e7eb;
   flex-shrink: 0;
+}
+
+.header-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.header-btn {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f1f5f9;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  color: #64748b;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.header-btn svg {
+  width: 18px;
+  height: 18px;
+}
+
+.header-btn:hover {
+  background: #e2e8f0;
+  color: #1e293b;
+}
+
+.header-btn.with-text {
+  width: auto;
+  padding: 0 12px;
+  gap: 6px;
+  font-size: 0.875rem;
+  font-weight: 500;
 }
 
 .logo {
@@ -426,6 +598,11 @@ body {
   animation: pulse 1.5s ease-in-out infinite;
 }
 
+.agent-status.working .status-dot {
+  background: #3b82f6;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.5; }
@@ -453,6 +630,12 @@ body {
 
 .user-avatar {
   background: #3b82f6;
+  color: white;
+}
+
+.user-avatar svg {
+  width: 18px;
+  height: 18px;
 }
 
 .agent-avatar {
@@ -493,6 +676,22 @@ body {
   color: #3b82f6;
   font-style: italic;
 }
+
+.tool-calls {
+  margin: 8px 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tool-call {
+  font-size: 0.75rem;
+  color: #374151;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-family: monospace;
+}
+
 
 .message-content {
   font-size: 0.9rem;

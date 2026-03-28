@@ -4,17 +4,14 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\" \"sleep 2 && npm run dev:agent\"",
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
     "dev:client": "npm run dev --prefix client",
     "dev:server": "npm run dev --prefix server",
-    "dev:agent": "npm run dev --prefix agent",
     "build": "npm run build --prefix client",
-    "build:backend": "echo 'No build step needed - using tsx'",
-    "install:all": "npm install && npm install --prefix client && npm install --prefix server && npm install --prefix agent",
-    "start": "npx tsx start.ts"
+    "install:all": "npm install && npm install --prefix client && npm install --prefix server",
+    "start": "npm run start --prefix server"
   },
   "devDependencies": {
-    "concurrently": "^9.0.0",
-    "tsx": "^4.20.6"
+    "concurrently": "^9.0.0"
   }
 }
