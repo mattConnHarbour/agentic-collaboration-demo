@@ -85,6 +85,8 @@ export class Agent {
 
       // Execute tool calls
       for (const call of message.tool_calls) {
+        if (call.type !== 'function') continue;
+
         const args = JSON.parse(call.function.arguments);
         console.log(`[Agent] Tool: ${call.function.name}`, args);
 

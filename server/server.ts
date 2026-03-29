@@ -1,6 +1,9 @@
 import dotenv from 'dotenv';
 dotenv.config({ path: '../.env' });
 
+import { readFileSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import websocketPlugin from '@fastify/websocket';
@@ -15,6 +18,11 @@ import {
 
 import { Agent } from './agent.js';
 import { Job } from './job.js';
+
+// Get package versions
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const sdkVersion = JSON.parse(readFileSync(join(__dirname, 'node_modules/@superdoc-dev/sdk/package.json'), 'utf-8')).version;
+const collabVersion = JSON.parse(readFileSync(join(__dirname, 'node_modules/@superdoc-dev/superdoc-yjs-collaboration/package.json'), 'utf-8')).version;
 
 // ============================================================================
 // Agent Registry
@@ -78,7 +86,13 @@ async function main() {
   await fastify.register(websocketPlugin);
 
   // Health check
-  fastify.get('/health', async () => ({ status: 'ok' }));
+  fastify.get('/health', async () => ({
+    status: 'ok',
+    versions: {
+      sdk: sdkVersion,
+      collab: collabVersion,
+    },
+  }));
 
   // Agent health check
   fastify.get('/health/agent', async (request) => {

@@ -3,6 +3,8 @@ import 'superdoc/style.css';
 import { onMounted, onBeforeUnmount, shallowRef, ref, nextTick } from 'vue';
 import { SuperDoc } from 'superdoc';
 
+const superdocVersion = __SUPERDOC_VERSION__;
+
 import sampleDocument from '/sample-document.docx?url';
 
 // Backend URL: use VITE_BACKEND_URL env var, or fall back to localhost for dev
@@ -52,6 +54,7 @@ const superdoc = shallowRef(null);
 const chatMessages = ref([]);
 const chatInput = ref('');
 const agentStatus = ref('disconnected');
+const backendVersions = ref({ sdk: null, collab: null });
 const currentToolCalls = ref([]);
 const chatContainer = ref(null);
 
@@ -298,7 +301,10 @@ const checkBackendHealth = async () => {
     const data = await response.json();
     if (data.status === 'ok') {
       agentStatus.value = 'ready';
-      console.log('[Client] Backend connected');
+      if (data.versions) {
+        backendVersions.value = data.versions;
+      }
+      console.log('[Client] Backend healthy:', data);
     } else {
       agentStatus.value = 'disconnected';
       console.error('[Client] Backend unhealthy:', data);
@@ -370,11 +376,18 @@ onBeforeUnmount(() => {
               <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
             </svg>
             <span>Document Agent</span>
+            <a v-if="backendVersions.sdk" class="version-pill" :href="`https://www.npmjs.com/package/@superdoc-dev/sdk/v/${backendVersions.sdk}`" target="_blank">sdk {{ backendVersions.sdk }}</a>
           </div>
           <div class="agent-status" :class="agentStatus">
             <span class="status-dot"></span>
             <span>{{ agentStatus === 'thinking' ? 'Thinking...' : agentStatus === 'working' ? 'Working...' : agentStatus === 'ready' ? 'Ready' : agentStatus === 'disconnected' ? 'Disconnected' : 'Offline' }}</span>
           </div>
+          <!-- Hidden version pills (kept for future use)
+          <div class="version-pills">
+            <a class="version-pill" :href="`https://www.npmjs.com/package/superdoc/v/${superdocVersion}`" target="_blank">client {{ superdocVersion }}</a>
+            <a v-if="backendVersions.collab" class="version-pill" :href="`https://www.npmjs.com/package/@superdoc-dev/superdoc-yjs-collaboration/v/${backendVersions.collab}`" target="_blank">collab {{ backendVersions.collab }}</a>
+          </div>
+          -->
         </div>
 
         <!-- Chat Messages -->
@@ -669,6 +682,28 @@ body {
 
 .agent-status.disconnected .status-dot {
   background: #ef4444;
+}
+
+.version-pills {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.version-pill {
+  font-size: 0.75rem;
+  color: #64748b;
+  padding: 2px 8px;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  text-decoration: none;
+  transition: all 0.15s;
+}
+
+.version-pill:hover {
+  background: #f1f5f9;
+  color: #3b82f6;
+  border-color: #3b82f6;
 }
 
 @keyframes pulse {
