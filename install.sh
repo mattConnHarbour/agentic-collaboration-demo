@@ -121,31 +121,13 @@ setup_api_key() {
 
   # Check if key already exists
   if [ -f "$env_file" ] && grep -q "ANTHROPIC_API_KEY" "$env_file"; then
-    warn "API key already configured in $env_file"
+    info "API key already configured"
     return
   fi
 
-  # Check if running interactively (has a TTY)
-  if [ ! -t 0 ]; then
-    warn "Non-interactive mode: skipping API key setup"
-    warn "Set ANTHROPIC_API_KEY later in $env_file"
-    return
-  fi
-
-  echo ""
-  info "Anthropic API key required for AI features."
-  info "Get one at: https://console.anthropic.com/settings/keys"
-  echo ""
-
-  read -p "Enter your Anthropic API key (or press Enter to skip): " api_key
-
-  if [ -n "$api_key" ]; then
-    echo "ANTHROPIC_API_KEY=$api_key" >> "$env_file"
-    chmod 600 "$env_file"
-    info "API key saved to $env_file"
-  else
-    warn "Skipped API key setup. Set ANTHROPIC_API_KEY later in $env_file"
-  fi
+  # Create empty env file
+  touch "$env_file"
+  chmod 600 "$env_file"
 }
 
 # Add to PATH
@@ -322,28 +304,25 @@ EOF
 
 # Print success message
 print_success() {
+  local env_file="$CONFIG_DIR/.env"
+  local has_key=false
+
+  if [ -f "$env_file" ] && grep -q "ANTHROPIC_API_KEY" "$env_file"; then
+    has_key=true
+  fi
+
   echo ""
-  echo -e "${GREEN}============================================${NC}"
-  echo -e "${GREEN}  SuperDoc installed successfully!${NC}"
-  echo -e "${GREEN}============================================${NC}"
-  echo ""
-  echo "Installed:"
-  echo "  ~/superdoc/bin/superdoc-open  - Open documents with AI editing"
-  echo "  ~/superdoc/bin/superdoc       - SuperDoc CLI"
-  echo "  ~/superdoc/assets/            - Client and tools"
-  echo "  ~/.claude/skills/superdoc/    - Claude Desktop skill"
-  echo ""
-  echo "Usage in Claude Desktop:"
-  echo "  'Edit my-document.docx and add an introduction'"
-  echo "  'Open report.docx with superdoc'"
-  echo ""
-  echo "Manual usage:"
-  echo "  superdoc-open document.docx"
+  echo "SUPERDOC_INSTALL_SUCCESS"
+  echo "binaries=$INSTALL_DIR"
+  echo "assets=$CONFIG_DIR/assets"
+  echo "skill=$SKILLS_DIR/superdoc"
+  echo "env_file=$env_file"
+  echo "api_key_configured=$has_key"
   echo ""
 
-  if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
-    warn "Restart your terminal or run:"
-    echo "  source ~/.zshrc  # or ~/.bashrc"
+  if [ "$has_key" = false ]; then
+    echo "ACTION_REQUIRED: Ask user for Anthropic API key, then run:"
+    echo "echo 'ANTHROPIC_API_KEY=<key>' > $env_file && chmod 600 $env_file"
   fi
 }
 
