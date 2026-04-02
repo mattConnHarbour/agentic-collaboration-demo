@@ -279,9 +279,12 @@ async function main() {
     (req, body, done) => done(null, body)
   );
 
-  // Serve static files from client dist (for production/bundled mode)
-  const clientDistPath = join(projectRoot, 'client/dist');
-  if (existsSync(clientDistPath)) {
+  // Serve static files from client dist
+  // Check env var first (for installed mode), then bundled location, then dev location
+  const clientDistPath = process.env.SUPERDOC_CLIENT_DIR
+    || (existsSync(join(projectRoot, 'client/dist')) ? join(projectRoot, 'client/dist') : null);
+
+  if (clientDistPath && existsSync(clientDistPath)) {
     await fastify.register(fastifyStatic, {
       root: clientDistPath,
       prefix: '/',

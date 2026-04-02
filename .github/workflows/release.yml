@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: bun-darwin-arm64
+            asset: superdoc-preview-darwin-arm64
+            sdk_platform: darwin-arm64
+          - target: bun-darwin-x64
+            asset: superdoc-preview-darwin-x64
+            sdk_platform: darwin-x64
+          - target: bun-linux-x64
+            asset: superdoc-preview-linux-x64
+            sdk_platform: linux-x64
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: |
+          npm install
+          cd client && npm install && npm run build && cd ..
+          cd server && npm install && cd ..
+
+      - name: Build binary
+        working-directory: server
+        run: |
+          bun build server.ts --compile --target=${{ matrix.target }} --outfile=../dist/${{ matrix.asset }}
+
+      - name: Bundle assets
+        run: |
+          mkdir -p dist/assets/client
+          mkdir -p dist/assets/tools
+          mkdir -p dist/assets/bin
+
+          # Copy client build
+          cp -r client/dist/* dist/assets/client/
+
+          # Copy tool definitions
+          cp server/node_modules/@superdoc-dev/sdk/tools/*.json dist/assets/tools/
+
+          # Download and extract platform-specific SDK binary
+          npm pack @superdoc-dev/sdk-${{ matrix.sdk_platform }} --pack-destination=dist/
+          tar -xzf dist/superdoc-dev-sdk-${{ matrix.sdk_platform }}-*.tgz -C dist/
+          cp dist/package/bin/superdoc dist/assets/bin/
+          chmod +x dist/assets/bin/superdoc
+
+      - name: Create tarball
+        run: |
+          cd dist
+          tar -czvf ${{ matrix.asset }}.tar.gz ${{ matrix.asset }} assets/
+          mv ${{ matrix.asset }}.tar.gz ../
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/**/*.tar.gz
+            install.sh
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

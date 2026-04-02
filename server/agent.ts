@@ -69,19 +69,25 @@ function dispatchTool(doc: SuperDocDocument, toolName: string, args: Record<stri
 
 const MAX_ITERATIONS = 20;
 
-// Load tools from file system (works in both dev and bundled mode)
+// Load tools from file system (works in dev, bundled, and installed modes)
 function loadTools(): Anthropic.Tool[] {
   const __dirname = dirname(fileURLToPath(import.meta.url));
 
-  // Try bundled location first (bin/tools/), then dev location (node_modules)
+  // Check locations in order: env var (installed), bundled, dev
+  const installedPath = process.env.SUPERDOC_TOOLS_DIR
+    ? join(process.env.SUPERDOC_TOOLS_DIR, 'tools.anthropic.json')
+    : null;
   const bundledPath = join(dirname(process.execPath), 'tools', 'tools.anthropic.json');
   const devPath = join(__dirname, 'node_modules/@superdoc-dev/sdk/tools/tools.anthropic.json');
 
-  const toolsPath = existsSync(bundledPath) ? bundledPath : devPath;
+  const toolsPath = (installedPath && existsSync(installedPath)) ? installedPath
+    : existsSync(bundledPath) ? bundledPath
+    : devPath;
+
   console.log(`[Agent] Loading tools from: ${toolsPath}`);
 
   if (!existsSync(toolsPath)) {
-    throw new Error(`Tools file not found at ${bundledPath} or ${devPath}`);
+    throw new Error(`Tools file not found. Checked: ${installedPath || 'N/A'}, ${bundledPath}, ${devPath}`);
   }
 
   const content = readFileSync(toolsPath, 'utf-8');
