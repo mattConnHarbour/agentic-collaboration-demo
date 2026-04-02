@@ -1,6 +1,6 @@
 # Agentic Collaboration Demo
 
-A chat-based AI agent that edits documents using the SuperDoc SDK and OpenAI. See the [README](./README.md) for setup instructions.
+A chat-based AI agent that edits documents using the SuperDoc SDK and Anthropic Claude. See the [README](./README.md) for setup instructions.
 
 ## Architecture
 
@@ -8,13 +8,13 @@ A chat-based AI agent that edits documents using the SuperDoc SDK and OpenAI. Se
 Vue Client (5173)          Collaboration Server (3050)          AI Agent
 ┌─────────────────┐        ┌─────────────────────────┐        ┌─────────────────┐
 │ SuperDoc Editor │◄──────►│ /collaboration/:docId   │◄──────►│ SDK client.open │
-│ Chat Sidebar    │◄──────►│ /chat/:roomId           │◄──────►│ Chat WebSocket  │
+│ Chat Sidebar    │◄──────►│ /chat (HTTP polling)    │◄──────►│ Anthropic Claude│
 └─────────────────┘        └─────────────────────────┘        └─────────────────┘
 ```
 
 - **Client**: Vue 3 app with SuperDoc editor and chat sidebar
-- **Server**: Fastify with WebSocket for collaboration (Yjs) and chat
-- **Agent**: Node.js process using SuperDoc SDK + OpenAI for document editing
+- **Server**: Fastify with WebSocket for collaboration (Yjs) and HTTP chat API
+- **Agent**: Integrated into server, uses SuperDoc SDK + Anthropic Claude for document editing
 
 ## Project Structure
 
@@ -25,16 +25,18 @@ client/
 
 server/
   server.ts            Fastify server with collaboration + chat endpoints
+  agent.ts             AI agent with agentic loop (Anthropic Claude)
+  job.ts               Async job management for chat requests
   package.json         Server dependencies
 
-agent/
-  agent.ts             Main agent with agentic loop
-  chat.ts              Chat WebSocket client class
-  package.json         Agent dependencies (SDK, OpenAI)
+bin/                   Compiled binary output (after build)
+  superdoc-preview     Standalone binary (~72MB)
+  client/dist/         Bundled Vue client
+  tools/               SDK tool definitions
+  node_modules/        SDK binary dependencies
 
-start.ts               Production entrypoint (spawns server + agent)
-.env                   Environment variables (OPENAI_API_KEY)
-package.json           Root scripts (dev, install:all, start)
+.env                   Environment variables (ANTHROPIC_API_KEY)
+package.json           Root scripts (dev, build, install:all)
 ```
 
 ## Key Patterns
@@ -58,19 +60,18 @@ const doc = await client.open({
 
 ### Getting Tools for LLM
 
-```typescript
-const { tools } = await chooseTools({ provider: 'openai' });
-// Returns array of OpenAI-compatible tool definitions
-```
-
-**Note**: The npm SDK has a simple API - just `{ provider }`. No `mode`, `groups`, or other options.
-
-### System Prompt
+Tools are loaded from the SDK's JSON file:
 
 ```typescript
-const systemPrompt = await getSystemPrompt();
-// Reads from SDK's system-prompt.md file (async because it reads from disk)
+import { readFileSync } from 'fs';
+
+const toolsPath = 'node_modules/@superdoc-dev/sdk/tools/tools.anthropic.json';
+const content = readFileSync(toolsPath, 'utf-8');
+const { tools } = JSON.parse(content);
+// Returns array of Anthropic-compatible tool definitions
 ```
+
+The binary build copies this to `bin/tools/tools.anthropic.json`.
 
 ### Executing Tools
 
@@ -87,23 +88,29 @@ const result = await dispatchSuperDocTool(doc, 'insert_content', {
 const MAX_ITERATIONS = 20;  // Prevent infinite loops
 
 for (let i = 0; i < MAX_ITERATIONS; i++) {
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4.1',
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 4096,
+    system: systemPrompt,
     messages,
     tools,
   });
 
-  const message = response.choices[0].message;
-  messages.push(message);
+  const toolUseBlocks = response.content.filter(block => block.type === 'tool_use');
 
-  if (!message.tool_calls?.length) {
-    return message.content;  // Done - no more tool calls
+  if (toolUseBlocks.length === 0) {
+    const textBlock = response.content.find(block => block.type === 'text');
+    return textBlock?.text || 'Done.';  // Done - no more tool calls
   }
 
-  for (const call of message.tool_calls) {
-    const result = await dispatchSuperDocTool(doc, call.function.name, JSON.parse(call.function.arguments));
-    messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) });
+  messages.push({ role: 'assistant', content: response.content });
+
+  const toolResults = [];
+  for (const toolUse of toolUseBlocks) {
+    const result = await dispatchSuperDocTool(doc, toolUse.name, toolUse.input);
+    toolResults.push({ type: 'tool_result', tool_use_id: toolUse.id, content: JSON.stringify(result) });
   }
+  messages.push({ role: 'user', content: toolResults });
 }
 ```
 
@@ -149,93 +156,109 @@ new SuperDoc({
 });
 ```
 
-## Chat Serialization
+## Chat API (HTTP Polling)
 
-The `Chat` class uses a queue to serialize message processing:
+The chat system uses HTTP polling instead of WebSockets for simplicity:
 
 ```typescript
-class Chat {
-  private processing = false;
-  private queue: string[] = [];
+// POST /chat - Create a job
+const { jobId } = await fetch('/chat', {
+  method: 'POST',
+  body: JSON.stringify({ sessionId, documentId, prompt })
+}).then(r => r.json());
 
-  serve(handler) {
-    this.ws.on('message', (data) => {
-      // Queue messages instead of processing immediately
-      this.queue.push(msg.message.content);
-      this.processQueue(handler);
-    });
-  }
-
-  private async processQueue(handler) {
-    if (this.processing) return;  // Already processing
-    this.processing = true;
-    while (this.queue.length > 0) {
-      const content = this.queue.shift();
-      await handler(content);  // Process one at a time
-    }
-    this.processing = false;
-  }
-}
+// GET /chat/jobs/:jobId - Poll for result
+const { status, result, toolCalls } = await fetch(`/chat/jobs/${jobId}`).then(r => r.json());
+// status: 'pending' | 'processing' | 'complete' | 'error'
 ```
 
-This prevents concurrent requests from corrupting the shared conversation history.
+Jobs are processed asynchronously and cleaned up after 5 minutes.
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `OPENAI_API_KEY` | Yes | OpenAI API key for the agent |
+| `ANTHROPIC_API_KEY` | Yes | Anthropic API key for the agent |
+| `SUPERDOC_CLI_BIN` | No | Path to SDK CLI binary (auto-detected in dev/bundled modes) |
 
-The `.env` file should be in the root of this example directory. The agent loads it with:
+The `.env` file should be in the root directory. The server loads it with:
 
 ```typescript
-dotenv.config({ path: join(__dirname, '..', '.env') });
+dotenv.config({ path: '../.env' });
 ```
 
 ## Scripts
 
 | Script | Description |
 |--------|-------------|
-| `npm run install:all` | Install dependencies for root + client + server + agent |
-| `npm run dev` | Run all components (server starts first, agent waits 2s) |
-| `npm run dev:server` | Run only the server |
+| `npm run install:all` | Install dependencies for root + client + server |
+| `npm run dev` | Run server + client concurrently |
+| `npm run dev:server` | Run only the server (includes agent) |
 | `npm run dev:client` | Run only the Vue client |
-| `npm run dev:agent` | Run only the agent |
-| `npm run start` | Production: spawn server + agent via start.ts |
-| `npm run build` | Build Vue client for production |
+| `npm run build` | Build client + server binary |
+| `npm run build:dist` | Clean build (removes bin/ first) |
+| `npm run start` | Run the server in production mode |
+| `npm run preview` | Run the compiled binary |
+
+### Building the Binary
+
+```bash
+npm run build:dist
+```
+
+This produces a standalone binary at `bin/superdoc-preview` (~72MB) that includes:
+- Compiled server + agent (Bun-compiled)
+- Vue client (in `bin/client/dist/`)
+- SDK tools JSON (in `bin/tools/`)
+- SDK CLI binary (in `bin/node_modules/`)
+
+### Running the Binary
+
+```bash
+# Open a document (auto-opens browser)
+./bin/superdoc-preview sample.docx
+
+# With options
+./bin/superdoc-preview --file sample.docx --port 3050 --no-browser
+
+# Positional argument also works
+./bin/superdoc-preview sample.docx --no-browser
+```
+
+CLI options:
+- `--file, -f <path>`: Path to DOCX file to open
+- `--port, -p <number>`: Server port (default: 3050)
+- `--no-browser`: Don't auto-open browser
 
 ## Common Issues
 
-### Agent shows "Offline"
+### Agent not available (503 error)
 
-- Check terminal for errors
-- Verify `OPENAI_API_KEY` is set in `.env`
-- Ensure server is running before agent connects
-
-### Race condition on startup
-
-The dev script adds a 2-second delay before starting the agent:
-
-```json
-"dev": "concurrently \"npm run dev:server\" \"npm run dev:client\" \"sleep 2 && npm run dev:agent\""
-```
+- In bundled binary mode, set `SUPERDOC_CLI_BIN` env var pointing to the SDK CLI binary
+- In dev mode, the SDK binary is auto-detected from node_modules
 
 ### Tool loop runs forever
 
 The agent has `MAX_ITERATIONS = 20` to prevent infinite tool-calling loops.
 
-### Concurrent requests corrupt history
+### Yjs "already imported" warning
 
-The Chat class queues messages and processes them sequentially.
+This warning appears when Yjs is imported multiple times (from server and SDK). It's harmless but indicates potential bundle optimization opportunities.
+
+### Port already in use
+
+Kill existing processes: `lsof -ti:3050 | xargs kill -9`
 
 ## SDK Version
 
-This example uses `@superdoc-dev/sdk@^1.1.0`. The SDK provides:
+This example uses `@superdoc-dev/sdk@^1.1.0` and `superdoc@^1.24.2`. Key SDK exports:
 
-- `createSuperDocClient()` - Create SDK client
-- `chooseTools({ provider })` - Get LLM tool definitions
-- `dispatchSuperDocTool(doc, name, args)` - Execute a tool
-- `getSystemPrompt()` - Get the recommended system prompt (async)
+- `createSuperDocClient()` - Create SDK client for document operations
+- `dispatchSuperDocTool(doc, name, args)` - Execute a tool on the document
+- `Editor.open(buffer, options)` - Open a document in headless mode (for seeding)
+- `editor.generateCollaborationUpdate()` - Generate Yjs binary update from document
+
+Tool definitions are loaded from `@superdoc-dev/sdk/tools/tools.anthropic.json`.
 
 ## Collaboration Server
 
@@ -258,6 +281,36 @@ fastify.get('/collaboration/:documentId', { websocket: true }, (socket, request)
 
 The `onChange` and `onAutoSave` callbacks are optional and not needed for this example.
 
+## Document Seeding
+
+When a DOCX file is provided via CLI, the server seeds the collaboration room with its content:
+
+```typescript
+async function seedCollaborationState(docPath: string, roomId: string): Promise<void> {
+  const fileBytes = readFileSync(docPath);
+  const editor = await Editor.open(Buffer.from(fileBytes), {
+    isHeadless: true,
+    documentId: roomId,
+    telemetry: { enabled: false },
+    user: { id: 'seed-bot', name: 'Seed Bot', email: 'seed-bot@superdoc.dev' },
+  });
+
+  try {
+    const update = await editor.generateCollaborationUpdate();
+    documentStates.set(roomId, update);  // Store Yjs binary for handleLoad
+  } finally {
+    editor.destroy();
+  }
+}
+```
+
+The seeding flow:
+1. `Editor.open()` opens the DOCX in headless mode (no UI)
+2. `generateCollaborationUpdate()` produces a Yjs binary update
+3. The update is stored in `documentStates` Map
+4. When clients connect, `handleLoad` returns this seeded state
+5. Auto-save periodically updates the stored state as users edit
+
 ## Deployment
 
 Split deployment: frontend on Cloudflare Pages, backend (server + agent) on Railway.
@@ -265,9 +318,8 @@ Split deployment: frontend on Cloudflare Pages, backend (server + agent) on Rail
 ```
 Cloudflare Pages                         Railway
 ┌──────────────────┐                    ┌─────────────────────────────────┐
-│  Vue Client      │───── wss:// ──────►│  start.ts                       │
-│  (static)        │                    │  ├── server.ts (WS endpoints)   │
-│                  │                    │  └── agent.ts (SDK + OpenAI)    │
+│  Vue Client      │───── wss:// ──────►│  server.ts                      │
+│  (static)        │                    │  └── agent.ts (integrated)      │
 └──────────────────┘                    └─────────────────────────────────┘
 ```
 
@@ -275,17 +327,16 @@ Cloudflare Pages                         Railway
 
 1. New Project → Deploy from GitHub
 2. Configure:
-   - **Root Directory**: `examples/document-api/agentic-collaboration`
    - **Build Command**: `npm run install:all`
    - **Start Command**: `npm run start`
-3. Add environment variable: `OPENAI_API_KEY`
+3. Add environment variable: `ANTHROPIC_API_KEY`
 4. Deploy → copy the generated URL (e.g., `https://xxx.up.railway.app`)
 
 ### Cloudflare Pages (Frontend)
 
 1. Connect GitHub repo
 2. Configure:
-   - **Root Directory**: `examples/document-api/agentic-collaboration/client`
+   - **Root Directory**: `client`
    - **Build Command**: `npm install && npm run build`
    - **Output Directory**: `dist`
 3. Add environment variable: `VITE_BACKEND_URL` = Railway URL (with `https://`)
@@ -293,6 +344,6 @@ Cloudflare Pages                         Railway
 
 ### How It Works
 
-- `start.ts` spawns server, waits for `/health` endpoint, then spawns agent
-- Client uses `VITE_BACKEND_URL` env var for WebSocket connections (falls back to `localhost:3050` for dev)
-- Agent connects to server via localhost (same Railway container)
+- Server serves static files from `client/dist` if available (bundled mode)
+- Client uses `VITE_BACKEND_URL` env var for backend connections (falls back to `localhost:3050` for dev)
+- Agent is integrated into server process (no separate spawn needed)

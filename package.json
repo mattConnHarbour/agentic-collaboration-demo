@@ -1,15 +1,19 @@
 {
-  "name": "agentic-collaboration",
+  "name": "superdoc-preview",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
     "dev:client": "npm run dev --prefix client",
     "dev:server": "npm run dev --prefix server",
-    "build": "npm run build --prefix client",
+    "build:client": "npm run build --prefix client",
+    "build:server": "npm run build --prefix server",
+    "build": "npm run build:client && npm run build:server",
+    "build:dist": "rm -rf bin && npm run build:client && npm run build:server",
     "install:all": "npm install && npm install --prefix client && npm install --prefix server",
     "start": "npm run start --prefix server",
+    "preview": "./bin/superdoc-preview",
     "deploy:server": "npm run typecheck --prefix server && railway up --detach",
     "deploy:client": "cd client && VITE_BACKEND_URL=https://backend-production-370a.up.railway.app npm run build && wrangler pages deploy dist --project-name=agentic-collaboration-demo --branch=main --commit-dirty=true",
     "deploy": "npm run deploy:server && npm run deploy:client"

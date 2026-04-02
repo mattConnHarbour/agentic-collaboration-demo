@@ -5,45 +5,20 @@ import { SuperDoc } from 'superdoc';
 
 const superdocVersion = __SUPERDOC_VERSION__;
 
-import sampleDocument from '/sample-document.docx?url';
-
-// Backend URL: use VITE_BACKEND_URL env var, or fall back to localhost for dev
-const backendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3050';
+// Backend URL: use VITE_BACKEND_URL env var, or fall back to current origin for bundled mode
+const backendUrl = import.meta.env.VITE_BACKEND_URL || window.location.origin;
 const wsUrl = backendUrl.replace(/^http/, 'ws');
 const COLLAB_URL = `${wsUrl}/collaboration`;
 
-// Room ID generation
-const ADJECTIVES = ['swift', 'brave', 'clever', 'mighty', 'gentle', 'fierce', 'calm', 'bold', 'wise', 'quick'];
-const ANIMALS = ['fox', 'owl', 'bear', 'wolf', 'eagle', 'tiger', 'otter', 'raven', 'falcon', 'panda'];
+// Document URL and config will be fetched from server
+const documentUrl = ref('');
+const serverConfig = ref(null);
 
-const generateRoomId = () => {
-  const adj = ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)];
-  const animal = ANIMALS[Math.floor(Math.random() * ANIMALS.length)];
-  const num = String(Math.floor(Math.random() * 1000)).padStart(3, '0');
-  return `${adj}-${animal}-${num}`;
-};
+console.log('[Client] Backend URL:', backendUrl);
+console.log('[Client] Current origin:', window.location.origin);
 
-const getOrCreateRoomId = () => {
-  const params = new URLSearchParams(window.location.search);
-  const roomParam = params.get('room');
-
-  if (roomParam) {
-    return roomParam;
-  }
-
-  // Generate a random room ID
-  const newRoomId = generateRoomId();
-
-  // Update URL without reload
-  const url = new URL(window.location.href);
-  url.searchParams.set('room', newRoomId);
-  window.history.replaceState({}, '', url.toString());
-
-  return newRoomId;
-};
-
-const roomId = ref(getOrCreateRoomId());
-const roomCopied = ref(false);
+// Room ID - only used for collaboration mode
+const roomId = ref('preview-session');
 
 // Generate a unique session ID for this browser session
 const SESSION_ID = crypto.randomUUID();
@@ -75,8 +50,54 @@ const hashToColor = (str) => {
 
 const toolColor = (name) => ({ backgroundColor: hashToColor(name) });
 
+const fetchConfig = async () => {
+  try {
+    const configUrl = `${backendUrl}/api/config`;
+    console.log('[Client] Fetching config from:', configUrl);
+
+    const response = await fetch(configUrl);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    const config = await response.json();
+    console.log('[Client] Config received:', config);
+
+    serverConfig.value = config;
+
+    if (config.documentUrl) {
+      // Construct full URL for the document
+      const docUrl = config.documentUrl.startsWith('http')
+        ? config.documentUrl
+        : `${backendUrl}${config.documentUrl}`;
+
+      documentUrl.value = docUrl;
+      console.log('[Client] Document URL set to:', docUrl);
+      console.log('[Client] Collaboration disabled:', config.disableCollaboration);
+
+      // Verify document is accessible
+      const docCheck = await fetch(docUrl, { method: 'HEAD' });
+      console.log('[Client] Document check:', docCheck.status, docCheck.headers.get('content-type'));
+    } else {
+      console.warn('[Client] No documentUrl in config - will show blank document');
+    }
+    return config;
+  } catch (e) {
+    console.error('[Client] Failed to fetch config:', e);
+    return null;
+  }
+};
+
 const initSuperDoc = () => {
-  console.log('[Client] Initializing SuperDoc for room:', roomId.value);
+  if (!documentUrl.value) {
+    console.error('[Client] No document URL available - cannot initialize SuperDoc');
+    return;
+  }
+
+  console.log('[Client] Initializing SuperDoc');
+  console.log('[Client]   Room ID:', roomId.value);
+  console.log('[Client]   Document URL:', documentUrl.value);
+  console.log('[Client]   Collaboration URL:', COLLAB_URL);
 
   superdoc.value = new SuperDoc({
     selector: '#superdoc',
@@ -85,7 +106,7 @@ const initSuperDoc = () => {
     document: {
       id: roomId.value,
       type: 'docx',
-      url: sampleDocument,
+      url: documentUrl.value,
     },
     layoutEngineOptions: {
       flowMode: 'semantic',
@@ -94,13 +115,19 @@ const initSuperDoc = () => {
     user: generateUserInfo(),
     modules: {
       collaboration: {
-        url: `${COLLAB_URL}`,
+        url: COLLAB_URL,
         token: 'token',
       },
       toolbar: {
         excludeItems: ['link', 'table', 'image'],
       },
     },
+  });
+
+  // Listen for document changes and auto-save
+  superdoc.value.on('change', () => {
+    console.log('[Client] Document changed');
+    debouncedSave();
   });
 };
 
@@ -248,51 +275,41 @@ const formatTime = (timestamp) => {
   return new Date(timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 };
 
-// File input ref for import
-const fileInput = ref(null);
+// Debounced auto-save
+let saveTimeout = null;
+const saveStatus = ref('saved'); // 'saved', 'saving', 'modified'
 
-const handleImport = () => {
-  fileInput.value?.click();
-};
+const saveDocument = async () => {
+  if (!superdoc.value || !serverConfig.value?.documentUrl) return;
 
-const onFileSelected = async (event) => {
-  const file = event.target.files?.[0];
-  if (!file || !superdoc.value) return;
-
-  try {
-    await superdoc.value.activeEditor.replaceFile(file);
-    console.log('[Client] Document imported:', file.name);
-  } catch (e) {
-    console.error('[Client] Import failed:', e);
-  }
-
-  // Reset input so same file can be selected again
-  event.target.value = '';
-};
-
-const handleExport = async () => {
-  if (!superdoc.value) return;
+  saveStatus.value = 'saving';
+  console.log('[Client] Auto-saving document...');
 
   try {
-    const now = new Date();
-    const pad = (n) => String(n).padStart(2, '0');
-    const filename = `SuperDoc_${pad(now.getMonth() + 1)}-${pad(now.getDate())}-${String(now.getFullYear()).slice(-2)}`;
-    await superdoc.value.export({ exportedName: filename });
-    console.log('[Client] Document exported:', filename);
+    const blob = await superdoc.value.export({ returnBlob: true });
+    const response = await fetch(`${backendUrl}/api/document`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' },
+      body: blob,
+    });
+
+    if (response.ok) {
+      saveStatus.value = 'saved';
+      console.log('[Client] Document saved');
+    } else {
+      console.error('[Client] Save failed:', response.status);
+      saveStatus.value = 'modified';
+    }
   } catch (e) {
-    console.error('[Client] Export failed:', e);
+    console.error('[Client] Save error:', e);
+    saveStatus.value = 'modified';
   }
 };
 
-const copyRoomId = async () => {
-  try {
-    await navigator.clipboard.writeText(window.location.href);
-    roomCopied.value = true;
-    setTimeout(() => { roomCopied.value = false; }, 1500);
-    console.log('[Client] Room URL copied:', window.location.href);
-  } catch (e) {
-    console.error('[Client] Copy failed:', e);
-  }
+const debouncedSave = () => {
+  saveStatus.value = 'modified';
+  if (saveTimeout) clearTimeout(saveTimeout);
+  saveTimeout = setTimeout(saveDocument, 1500);
 };
 
 const checkBackendHealth = async () => {
@@ -315,7 +332,8 @@ const checkBackendHealth = async () => {
   }
 };
 
-onMounted(() => {
+onMounted(async () => {
+  await fetchConfig();
   initSuperDoc();
   checkBackendHealth();
 });
@@ -335,27 +353,10 @@ onBeforeUnmount(() => {
         <span class="logo-text">SuperDoc</span>
       </div>
       <div class="header-actions">
-        <button class="header-btn with-text" @click="copyRoomId" title="Click to copy room ID">
-          <span>{{ roomCopied ? 'Copied!' : `room: ${roomId}` }}</span>
-        </button>
-        <input
-          type="file"
-          ref="fileInput"
-          @change="onFileSelected"
-          accept=".docx,.doc"
-          style="display: none"
-        />
-        <button class="header-btn with-text" @click="handleImport" title="Import">
-          <span>Import</span>
-          <svg viewBox="0 0 640 640" fill="currentColor">
-            <path d="M352 173.3L352 384C352 401.7 337.7 416 320 416C302.3 416 288 401.7 288 384L288 173.3L246.6 214.7C234.1 227.2 213.8 227.2 201.3 214.7C188.8 202.2 188.8 181.9 201.3 169.4L297.3 73.4C309.8 60.9 330.1 60.9 342.6 73.4L438.6 169.4C451.1 181.9 451.1 202.2 438.6 214.7C426.1 227.2 405.8 227.2 393.3 214.7L352 173.3zM320 464C364.2 464 400 428.2 400 384L480 384C515.3 384 544 412.7 544 448L544 480C544 515.3 515.3 544 480 544L160 544C124.7 544 96 515.3 96 480L96 448C96 412.7 124.7 384 160 384L240 384C240 428.2 275.8 464 320 464zM464 488C477.3 488 488 477.3 488 464C488 450.7 477.3 440 464 440C450.7 440 440 450.7 440 464C440 477.3 450.7 488 464 488z"/>
-          </svg>
-        </button>
-        <button class="header-btn" @click="handleExport" title="Export">
-          <svg viewBox="0 0 640 640" fill="currentColor">
-            <path d="M352 96C352 78.3 337.7 64 320 64C302.3 64 288 78.3 288 96L288 306.7L246.6 265.3C234.1 252.8 213.8 252.8 201.3 265.3C188.8 277.8 188.8 298.1 201.3 310.6L297.3 406.6C309.8 419.1 330.1 419.1 342.6 406.6L438.6 310.6C451.1 298.1 451.1 277.8 438.6 265.3C426.1 252.8 405.8 252.8 393.3 265.3L352 306.7L352 96zM160 384C124.7 384 96 412.7 96 448L96 480C96 515.3 124.7 544 160 544L480 544C515.3 544 544 515.3 544 480L544 448C544 412.7 515.3 384 480 384L433.1 384L376.5 440.6C345.3 471.8 294.6 471.8 263.4 440.6L206.9 384L160 384zM464 440C477.3 440 488 450.7 488 464C488 477.3 477.3 488 464 488C450.7 488 440 477.3 440 464C440 450.7 450.7 440 464 440z"/>
-          </svg>
-        </button>
+        <span v-if="serverConfig?.documentName" class="document-name">{{ serverConfig.documentName }}</span>
+        <span class="save-status" :class="saveStatus">
+          {{ saveStatus === 'saving' ? 'Saving...' : saveStatus === 'modified' ? 'Modified' : 'Saved' }}
+        </span>
       </div>
     </header>
 
@@ -504,7 +505,36 @@ body {
 
 .header-actions {
   display: flex;
-  gap: 8px;
+  align-items: center;
+  gap: 12px;
+}
+
+.document-name {
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: #374151;
+}
+
+.save-status {
+  font-size: 0.75rem;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-weight: 500;
+}
+
+.save-status.saved {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.save-status.modified {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.save-status.saving {
+  background: #e0f2fe;
+  color: #0369a1;
 }
 
 .header-btn {
