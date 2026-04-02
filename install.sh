@@ -226,6 +226,18 @@ install_skill() {
 
 Use this skill to edit or preview Word documents (.docx files).
 
+## Setup
+
+If the user asks to set up SuperDoc or configure their API key:
+
+```bash
+# Set the Anthropic API key (required for AI features in preview mode)
+echo "ANTHROPIC_API_KEY=sk-ant-..." > ~/superdoc/.env
+chmod 600 ~/superdoc/.env
+```
+
+The wrapper scripts automatically load this file - no `export` needed.
+
 ## Two Modes
 
 ### 1. Direct Edit Mode (use superdoc CLI)
@@ -287,6 +299,22 @@ This opens a browser with:
 - Always use absolute paths for documents
 - For direct edits, remember to `save` and `close` when done
 - The document must be a .docx file
+
+## Troubleshooting
+
+If commands fail with "command not found":
+```bash
+# Check if installed
+ls ~/superdoc/bin/
+
+# Add to PATH for current session
+export PATH="$HOME/superdoc/bin:$PATH"
+
+# Or reinstall
+curl -fsSL https://raw.githubusercontent.com/mattConnHarbour/agentic-collaboration-demo/claude-desktop/install.sh | bash
+```
+
+If preview mode shows API errors, set the API key (see Setup section above).
 EOF
 
   info "Installed Claude skill to $SKILLS_DIR/superdoc/"
