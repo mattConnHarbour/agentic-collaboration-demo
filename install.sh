@@ -125,6 +125,13 @@ setup_api_key() {
     return
   fi
 
+  # Check if running interactively (has a TTY)
+  if [ ! -t 0 ]; then
+    warn "Non-interactive mode: skipping API key setup"
+    warn "Set ANTHROPIC_API_KEY later in $env_file"
+    return
+  fi
+
   echo ""
   info "Anthropic API key required for AI features."
   info "Get one at: https://console.anthropic.com/settings/keys"
