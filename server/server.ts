@@ -1,8 +1,21 @@
 import dotenv from 'dotenv';
-dotenv.config({ path: '../.env' });
-
 import { readFileSync, existsSync } from 'fs';
 import { dirname, join, resolve, basename } from 'path';
+import { homedir } from 'os';
+
+// Load .env from multiple locations: installed (~superdoc/.env) or dev (../.env)
+const envPaths = [
+  join(homedir(), 'superdoc', '.env'),  // installed mode
+  join(dirname(process.execPath), '..', '.env'),  // relative to binary
+  '../.env',  // dev mode
+];
+for (const envPath of envPaths) {
+  if (existsSync(envPath)) {
+    dotenv.config({ path: envPath });
+    console.log(`[Server] Loaded env from: ${envPath}`);
+    break;
+  }
+}
 import { fileURLToPath } from 'url';
 import { exec } from 'child_process';
 import Fastify from 'fastify';
@@ -109,15 +122,15 @@ function openBrowser(url: string) {
 // Get directory paths
 // Handle both development mode and bundled binary mode
 const __dirname = dirname(fileURLToPath(import.meta.url));
-
-// Detect if running as bundled binary (Bun compile puts the binary in a different location)
-const isBundled = process.execPath.includes('superdoc-preview') || !existsSync(join(__dirname, 'package.json'));
 const execDir = dirname(process.execPath);
 
-// In bundled mode, look for client/dist relative to the binary
+// Detect if running as bundled binary (check if __dirname is virtual bun path)
+const isBundled = __dirname.startsWith('/$bunfs') || !existsSync(join(__dirname, 'package.json'));
+
+// In bundled/installed mode, assets are at ../assets/ relative to binary
 // In dev mode, use the normal project structure
 const serverRoot = isBundled ? execDir : (__dirname.endsWith('dist') ? dirname(__dirname) : __dirname);
-const projectRoot = isBundled ? execDir : dirname(serverRoot);
+const projectRoot = isBundled ? dirname(execDir) : dirname(serverRoot); // ~/superdoc/ in installed mode
 
 // Get package versions - try to read from node_modules, fall back to embedded versions
 let sdkVersion = '1.2.0';  // Fallback version
@@ -280,8 +293,9 @@ async function main() {
   );
 
   // Serve static files from client dist
-  // Check env var first (for installed mode), then bundled location, then dev location
+  // Check in order: env var, installed (assets/client), dev (client/dist)
   const clientDistPath = process.env.SUPERDOC_CLIENT_DIR
+    || (existsSync(join(projectRoot, 'assets/client')) ? join(projectRoot, 'assets/client') : null)
     || (existsSync(join(projectRoot, 'client/dist')) ? join(projectRoot, 'client/dist') : null);
 
   if (clientDistPath && existsSync(clientDistPath)) {

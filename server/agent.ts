@@ -8,12 +8,20 @@ import { fileURLToPath } from 'url';
 import Anthropic from '@anthropic-ai/sdk';
 
 // Patch the SDK's binary resolution before importing
-// Respect user-provided path, otherwise check bundled location
+// Check locations in order: env var, installed (assets/bin or bin/), dev (node_modules)
 if (!process.env.SUPERDOC_CLI_BIN) {
-  const sdkBinaryPath = join(dirname(process.execPath), 'node_modules/@superdoc-dev/sdk-darwin-arm64/bin/superdoc');
-  if (existsSync(sdkBinaryPath)) {
-    process.env.SUPERDOC_CLI_BIN = sdkBinaryPath;
-    console.log(`[Agent] SDK binary found at: ${sdkBinaryPath}`);
+  const execDir = dirname(process.execPath);
+  const candidates = [
+    join(execDir, '..', 'assets', 'bin', 'superdoc'),  // ~/superdoc/assets/bin/superdoc
+    join(execDir, 'superdoc-bin'),                      // ~/superdoc/bin/superdoc-bin
+    join(execDir, 'node_modules/@superdoc-dev/sdk-darwin-arm64/bin/superdoc'),  // dev mode
+  ];
+  for (const path of candidates) {
+    if (existsSync(path)) {
+      process.env.SUPERDOC_CLI_BIN = path;
+      console.log(`[Agent] SDK binary found at: ${path}`);
+      break;
+    }
   }
 } else {
   console.log(`[Agent] Using CLI binary from env: ${process.env.SUPERDOC_CLI_BIN}`);
@@ -90,7 +98,7 @@ function loadTools(): Anthropic.Tool[] {
   console.log(`[Agent] Loading tools from: ${toolsPath}`);
 
   if (!existsSync(toolsPath)) {
-    throw new Error(`Tools file not found. Checked: ${installedPath || 'N/A'}, ${bundledPath}, ${devPath}`);
+    throw new Error(`Tools file not found. Checked: ${installedPath || 'N/A'}, ${assetsPath}, ${bundledPath}, ${devPath}`);
   }
 
   const content = readFileSync(toolsPath, 'utf-8');
