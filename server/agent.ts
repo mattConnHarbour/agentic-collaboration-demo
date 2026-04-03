@@ -72,15 +72,18 @@ const MAX_ITERATIONS = 20;
 // Load tools from file system (works in dev, bundled, and installed modes)
 function loadTools(): Anthropic.Tool[] {
   const __dirname = dirname(fileURLToPath(import.meta.url));
+  const execDir = dirname(process.execPath);
 
-  // Check locations in order: env var (installed), bundled, dev
+  // Check locations in order: env var, installed (~/superdoc/assets), bundled, dev
   const installedPath = process.env.SUPERDOC_TOOLS_DIR
     ? join(process.env.SUPERDOC_TOOLS_DIR, 'tools.anthropic.json')
     : null;
-  const bundledPath = join(dirname(process.execPath), 'tools', 'tools.anthropic.json');
+  const assetsPath = join(execDir, '..', 'assets', 'tools', 'tools.anthropic.json'); // ~/superdoc/assets/tools/
+  const bundledPath = join(execDir, 'tools', 'tools.anthropic.json');
   const devPath = join(__dirname, 'node_modules/@superdoc-dev/sdk/tools/tools.anthropic.json');
 
   const toolsPath = (installedPath && existsSync(installedPath)) ? installedPath
+    : existsSync(assetsPath) ? assetsPath
     : existsSync(bundledPath) ? bundledPath
     : devPath;
 

@@ -250,7 +250,7 @@ Key commands:
 
 Run `superdoc doc --help` for full command reference.
 
-### 2. Preview Mode (use superdoc-open)
+### 2. Preview Mode (use superdoc-open wrapper)
 When the user wants to **preview, view, or collaboratively edit** with the browser UI.
 
 Examples:
@@ -258,8 +258,10 @@ Examples:
 - "Let me see my-doc.docx"
 - "Open document.docx so I can edit it interactively"
 
+**IMPORTANT: Always use the `superdoc-open` wrapper, NOT `superdoc-preview` directly.**
+
 ```bash
-superdoc-open /path/to/document.docx
+~/superdoc/bin/superdoc-open /absolute/path/to/document.docx
 ```
 
 This opens a browser with:
@@ -273,9 +275,9 @@ This opens a browser with:
 |--------------|------|---------|
 | "Add X to document.docx" | Direct Edit | `superdoc doc open ...` |
 | "Change the title in doc.docx" | Direct Edit | `superdoc doc open ...` |
-| "Preview my-file.docx" | Preview | `superdoc-open ...` |
-| "Open doc.docx for editing" | Preview | `superdoc-open ...` |
-| "Show me document.docx" | Preview | `superdoc-open ...` |
+| "Preview my-file.docx" | Preview | `~/superdoc/bin/superdoc-open ...` |
+| "Open doc.docx for editing" | Preview | `~/superdoc/bin/superdoc-open ...` |
+| "Show me document.docx" | Preview | `~/superdoc/bin/superdoc-open ...` |
 
 ## Notes
 - Always use absolute paths for documents
