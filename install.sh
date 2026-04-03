@@ -163,7 +163,12 @@ setup_path() {
 
 # Create wrapper scripts
 create_wrappers() {
-  # Wrapper for preview app
+  # Rename raw preview binary so Claude can't discover it
+  if [ -f "$INSTALL_DIR/superdoc-preview" ]; then
+    mv "$INSTALL_DIR/superdoc-preview" "$INSTALL_DIR/.superdoc-preview-bin"
+  fi
+
+  # Wrapper for preview app - this is what users and Claude should call
   cat > "$INSTALL_DIR/superdoc-open" << 'EOF'
 #!/bin/bash
 # Load config
@@ -176,7 +181,7 @@ export SUPERDOC_CLI_BIN="$HOME/superdoc/bin/superdoc-bin"
 export SUPERDOC_CLIENT_DIR="$HOME/superdoc/assets/client"
 export SUPERDOC_TOOLS_DIR="$HOME/superdoc/assets/tools"
 
-exec "$HOME/superdoc/bin/superdoc-preview" "$@"
+exec "$HOME/superdoc/bin/.superdoc-preview-bin" "$@"
 EOF
   chmod +x "$INSTALL_DIR/superdoc-open"
 
