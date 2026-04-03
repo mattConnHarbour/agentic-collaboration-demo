@@ -161,47 +161,36 @@ setup_path() {
   fi
 }
 
-# Create wrapper scripts
+# Create wrappers and redirects
 create_wrappers() {
-  # Rename raw preview binary so Claude can't discover it
+  # Rename preview binary to superdoc-open (the correct command)
   if [ -f "$INSTALL_DIR/superdoc-preview" ]; then
-    mv "$INSTALL_DIR/superdoc-preview" "$INSTALL_DIR/.superdoc-preview-bin"
+    mv "$INSTALL_DIR/superdoc-preview" "$INSTALL_DIR/superdoc-open"
+    chmod +x "$INSTALL_DIR/superdoc-open"
   fi
 
-  # Wrapper for preview app - this is what users and Claude should call
-  cat > "$INSTALL_DIR/superdoc-open" << 'EOF'
+  # Create superdoc-preview redirect - if Claude tries to run this, redirect to superdoc-open
+  cat > "$INSTALL_DIR/superdoc-preview" << 'EOF'
 #!/bin/bash
-# Load config
-if [ -f "$HOME/superdoc/.env" ]; then
-  export $(grep -v '^#' "$HOME/superdoc/.env" | xargs)
-fi
-
-# Set paths for installed mode
-export SUPERDOC_CLI_BIN="$HOME/superdoc/bin/superdoc-bin"
-export SUPERDOC_CLIENT_DIR="$HOME/superdoc/assets/client"
-export SUPERDOC_TOOLS_DIR="$HOME/superdoc/assets/tools"
-
-exec "$HOME/superdoc/bin/.superdoc-preview-bin" "$@"
+echo "ERROR: superdoc-preview is deprecated. Use superdoc-open instead."
+echo "REDIRECT: Running superdoc-open with your arguments..."
+echo ""
+exec "$HOME/superdoc/bin/superdoc-open" "$@"
 EOF
-  chmod +x "$INSTALL_DIR/superdoc-open"
+  chmod +x "$INSTALL_DIR/superdoc-preview"
 
-  # Rename raw CLI binary and create wrapper
+  # Rename raw CLI binary and keep superdoc as the command
   if [ -f "$INSTALL_DIR/superdoc" ]; then
     mv "$INSTALL_DIR/superdoc" "$INSTALL_DIR/superdoc-bin"
   fi
 
   cat > "$INSTALL_DIR/superdoc" << 'EOF'
 #!/bin/bash
-# Load config for CLI
-if [ -f "$HOME/superdoc/.env" ]; then
-  export $(grep -v '^#' "$HOME/superdoc/.env" | xargs)
-fi
-
 exec "$HOME/superdoc/bin/superdoc-bin" "$@"
 EOF
   chmod +x "$INSTALL_DIR/superdoc"
 
-  info "Created wrapper scripts"
+  info "Created wrappers"
 }
 
 # Install Claude Desktop skill
