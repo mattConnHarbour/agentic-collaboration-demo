@@ -250,7 +250,7 @@ Key commands:
 
 Run `superdoc doc --help` for full command reference.
 
-### 2. Preview Mode (use superdoc-open wrapper)
+### 2. Preview Mode
 When the user wants to **preview, view, or collaboratively edit** with the browser UI.
 
 Examples:
@@ -258,11 +258,13 @@ Examples:
 - "Let me see my-doc.docx"
 - "Open document.docx so I can edit it interactively"
 
-**IMPORTANT: Always use the `superdoc-open` wrapper, NOT `superdoc-preview` directly.**
+**CRITICAL: You MUST use this exact command:**
 
 ```bash
 ~/superdoc/bin/superdoc-open /absolute/path/to/document.docx
 ```
+
+DO NOT use any other binary. DO NOT use superdoc-preview. ONLY use superdoc-open.
 
 This opens a browser with:
 - Live document preview
@@ -299,6 +301,12 @@ curl -fsSL https://raw.githubusercontent.com/mattConnHarbour/agentic-collaborati
 ```
 
 If preview mode shows API errors, set the API key (see Setup section above).
+
+## IMPORTANT REMINDERS
+
+- For preview: ONLY use `~/superdoc/bin/superdoc-open` - never use superdoc-preview
+- For direct edits: Use `superdoc doc open/get/insert/save/close` commands
+- Always use absolute paths (starting with / or ~)
 EOF
 
   info "Installed Claude skill to $SKILLS_DIR/superdoc/"
