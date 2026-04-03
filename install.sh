@@ -78,7 +78,7 @@ get_release_url() {
 install_binaries() {
   local tmp_dir=$(mktemp -d)
 
-  local asset="superdoc-preview-${PLATFORM}.tar.gz"
+  local asset="superdoc-${PLATFORM}.tar.gz"
   local url=$(get_release_url "$asset")
 
   info "Downloading SuperDoc..."
@@ -88,7 +88,7 @@ install_binaries() {
   tar -xzf "$tmp_dir/release.tar.gz" -C "$tmp_dir"
 
   # Install preview binary
-  local binary_name="superdoc-preview-${PLATFORM}"
+  local binary_name="superdoc-${PLATFORM}"
   mv "$tmp_dir/$binary_name" "$INSTALL_DIR/superdoc-preview"
   chmod +x "$INSTALL_DIR/superdoc-preview"
   info "Installed superdoc-preview"
