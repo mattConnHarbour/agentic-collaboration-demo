@@ -4,6 +4,7 @@ import { dirname, join, resolve, basename } from 'path';
 import { homedir } from 'os';
 
 // Load .env from multiple locations: installed (~superdoc/.env) or dev (../.env)
+// Explicitly read and parse to ensure it works in GUI app context
 const envPaths = [
   join(homedir(), 'superdoc', '.env'),  // installed mode
   join(dirname(process.execPath), '..', '.env'),  // relative to binary
@@ -11,11 +12,36 @@ const envPaths = [
 ];
 for (const envPath of envPaths) {
   if (existsSync(envPath)) {
-    dotenv.config({ path: envPath });
-    console.log(`[Server] Loaded env from: ${envPath}`);
+    try {
+      const envContent = readFileSync(envPath, 'utf-8');
+      // Parse each line and set env vars explicitly
+      for (const line of envContent.split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed && !trimmed.startsWith('#')) {
+          const eqIndex = trimmed.indexOf('=');
+          if (eqIndex > 0) {
+            const key = trimmed.substring(0, eqIndex).trim();
+            let value = trimmed.substring(eqIndex + 1).trim();
+            // Remove quotes if present
+            if ((value.startsWith('"') && value.endsWith('"')) ||
+                (value.startsWith("'") && value.endsWith("'"))) {
+              value = value.slice(1, -1);
+            }
+            process.env[key] = value;
+          }
+        }
+      }
+      console.log(`[Server] Loaded env from: ${envPath}`);
+      console.log(`[Server] ANTHROPIC_API_KEY set: ${process.env.ANTHROPIC_API_KEY ? 'yes' : 'no'}`);
+    } catch (e) {
+      console.error(`[Server] Failed to load env from ${envPath}:`, e);
+    }
     break;
   }
 }
+
+// Also try dotenv as fallback
+dotenv.config({ path: '../.env' });
 import { fileURLToPath } from 'url';
 import { exec } from 'child_process';
 import Fastify from 'fastify';
