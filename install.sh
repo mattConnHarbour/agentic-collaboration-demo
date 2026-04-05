@@ -136,6 +136,58 @@ setup_api_key() {
   chmod 600 "$env_file"
 }
 
+# Configure Claude Desktop MCP
+setup_mcp() {
+  local claude_config_dir="$HOME/Library/Application Support/Claude"
+  local claude_config="$claude_config_dir/claude_desktop_config.json"
+
+  # Only run on macOS
+  if [ "$(uname)" != "Darwin" ]; then
+    return
+  fi
+
+  # Create Claude config directory if needed
+  mkdir -p "$claude_config_dir"
+
+  # Our MCP server config
+  local mcp_entry='{
+    "superdoc": {
+      "command": "node",
+      "args": ["'"$INSTALL_DIR"'/superdoc-mcp-wrapper.js"],
+      "env": {
+        "SUPERDOC_HOME": "'"$CONFIG_DIR"'"
+      }
+    }
+  }'
+
+  if [ -f "$claude_config" ]; then
+    # Config exists - check if we can merge with jq
+    if command -v jq &> /dev/null; then
+      # Merge our MCP server into existing config
+      local tmp_config=$(mktemp)
+      jq --argjson superdoc "$mcp_entry" '.mcpServers = (.mcpServers // {}) + $superdoc' "$claude_config" > "$tmp_config"
+      mv "$tmp_config" "$claude_config"
+      info "Added SuperDoc to Claude Desktop MCP config"
+    else
+      # No jq - check if superdoc already configured
+      if grep -q '"superdoc"' "$claude_config"; then
+        info "SuperDoc MCP already in Claude Desktop config"
+      else
+        warn "Could not auto-configure MCP (install jq for auto-config)"
+        warn "Manually add to: $claude_config"
+      fi
+    fi
+  else
+    # No config exists - create new one
+    cat > "$claude_config" << MCPEOF
+{
+  "mcpServers": $mcp_entry
+}
+MCPEOF
+    info "Created Claude Desktop config with SuperDoc MCP"
+  fi
+}
+
 # Add to PATH
 setup_path() {
   local shell_rc=""
@@ -206,129 +258,52 @@ install_skill() {
   cat > "$SKILLS_DIR/superdoc/skill.md" << 'EOF'
 # SuperDoc Skill
 
-Use this skill to edit or preview Word documents (.docx files).
+Edit and preview Word documents (.docx files).
 
 ## Setup
 
-If the user asks to set up SuperDoc or configure their API key:
+If the user asks to configure their API key:
 
 ```bash
-# Set the Anthropic API key (required for AI features in preview mode)
 echo "ANTHROPIC_API_KEY=sk-ant-..." > ~/superdoc/.env
 chmod 600 ~/superdoc/.env
 ```
 
-The wrapper scripts automatically load this file - no `export` needed.
+## Document Editing
 
-## Two Modes
+For editing documents, you have MCP tools available:
+- Use MCP tools when available (they appear as native Claude tools)
+- These tools let you open, read, edit, and save .docx files directly
 
-### 1. Direct Edit Mode (use superdoc CLI)
-When the user asks you to **edit, modify, or change** a document directly.
+## Preview Mode
 
-Examples:
-- "Add an introduction to report.docx"
-- "Fix the typos in my-doc.docx"
-- "Make the title bold in document.docx"
-
-Use the `superdoc` CLI tool:
-```bash
-superdoc doc open /path/to/document.docx
-superdoc doc get --action text
-superdoc doc insert --value "New content here" --block-id "00000001" --offset 0
-superdoc doc save
-superdoc doc close
-```
-
-Key commands:
-- `superdoc doc open <file>` - Open document for editing
-- `superdoc doc get --action text` - Get document text content
-- `superdoc doc get --action blocks` - Get document structure with block IDs
-- `superdoc doc insert --value "text" --block-id "ID" --offset N` - Insert text
-- `superdoc doc create --action paragraph --text "content"` - Create new paragraph
-- `superdoc doc save` - Save changes
-- `superdoc doc close` - Close document
-
-Run `superdoc doc --help` for full command reference.
-
-### 2. Preview Mode
-When the user wants to **preview, view, or collaboratively edit** with the browser UI.
-
-Examples:
-- "Open report.docx for preview"
-- "Let me see my-doc.docx"
-- "Open document.docx so I can edit it interactively"
-
-**CRITICAL: You MUST use this exact command:**
+When the user wants to **view or preview** a document in browser:
 
 ```bash
 ~/superdoc/bin/superdoc-open /absolute/path/to/document.docx
 ```
 
-DO NOT use any other binary. DO NOT use superdoc-preview. ONLY use superdoc-open.
+**CRITICAL: Always use `superdoc-open`, never `superdoc-preview`**
 
 This opens a browser with:
 - Live document preview
-- AI chat assistant for interactive editing
-- Auto-save every 2 seconds
+- AI chat assistant
+- Auto-save
 
-## Choosing the Right Mode
+## Quick Reference
 
-| User Request | Mode | Command |
-|--------------|------|---------|
-| "Add X to document.docx" | Direct Edit | `superdoc doc open ...` |
-| "Change the title in doc.docx" | Direct Edit | `superdoc doc open ...` |
-| "Preview my-file.docx" | Preview | `~/superdoc/bin/superdoc-open ...` |
-| "Open doc.docx for editing" | Preview | `~/superdoc/bin/superdoc-open ...` |
-| "Show me document.docx" | Preview | `~/superdoc/bin/superdoc-open ...` |
+| User Request | Action |
+|--------------|--------|
+| "Edit document.docx" | Use MCP tools |
+| "Add intro to doc.docx" | Use MCP tools |
+| "Preview file.docx" | `~/superdoc/bin/superdoc-open /path/to/file.docx` |
+| "Show me doc.docx" | `~/superdoc/bin/superdoc-open /path/to/doc.docx` |
+| "Set API key to sk-ant-..." | `echo "ANTHROPIC_API_KEY=sk-ant-..." > ~/superdoc/.env` |
 
 ## Notes
-- Always use absolute paths for documents
-- For direct edits, remember to `save` and `close` when done
-- The document must be a .docx file
-
-## Troubleshooting
-
-If commands fail with "command not found":
-```bash
-# Check if installed
-ls ~/superdoc/bin/
-
-# Add to PATH for current session
-export PATH="$HOME/superdoc/bin:$PATH"
-
-# Or reinstall
-curl -fsSL https://raw.githubusercontent.com/mattConnHarbour/agentic-collaboration-demo/claude-desktop/install.sh | bash
-```
-
-If preview mode shows API errors, set the API key (see Setup section above).
-
-## MCP Server Configuration (Optional)
-
-For native Claude Desktop integration via MCP, add this to your Claude Desktop config:
-
-**macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-
-```json
-{
-  "mcpServers": {
-    "superdoc": {
-      "command": "node",
-      "args": ["~/superdoc/bin/superdoc-mcp-wrapper.js"],
-      "env": {
-        "SUPERDOC_HOME": "~/superdoc"
-      }
-    }
-  }
-}
-```
-
-The MCP wrapper keeps the server alive across Claude Desktop reconnects.
-
-## IMPORTANT REMINDERS
-
-- For preview: ONLY use `~/superdoc/bin/superdoc-open` - never use superdoc-preview
-- For direct edits: Use `superdoc doc open/get/insert/save/close` commands
-- Always use absolute paths (starting with / or ~)
+- Always use absolute paths (starting with / or ~/)
+- MCP tools handle open/edit/save automatically
+- Preview opens browser for visual editing
 EOF
 
   info "Installed Claude skill to $SKILLS_DIR/superdoc/"
@@ -345,23 +320,28 @@ print_success() {
 
   echo ""
   echo "SUPERDOC_INSTALL_SUCCESS"
-  echo "binaries=$INSTALL_DIR"
-  echo "assets=$CONFIG_DIR/assets"
-  echo "skill=$SKILLS_DIR/superdoc"
-  echo "env_file=$env_file"
-  echo "api_key_configured=$has_key"
+  echo ""
+  echo "Installed:"
+  echo "  - MCP server (for document editing in Claude Desktop)"
+  echo "  - Preview app (for browser-based viewing)"
+  echo "  - CLI tools (for terminal usage)"
+  echo ""
+  echo "NEXT STEPS:"
+  echo "1. Restart Claude Desktop (Cmd+Q then reopen)"
+  echo "2. Claude will now have native document editing tools"
   echo ""
 
   if [ "$has_key" = false ]; then
-    echo "ACTION_REQUIRED: Ask user for Anthropic API key, then run:"
-    echo "echo 'ANTHROPIC_API_KEY=<key>' > $env_file && chmod 600 $env_file"
+    echo "API_KEY_REQUIRED:"
+    echo "Tell Claude: 'Set my SuperDoc API key to sk-ant-...'"
+    echo "Or run: echo 'ANTHROPIC_API_KEY=<key>' > $env_file"
   fi
 }
 
 # Main
 main() {
   echo ""
-  info "Installing SuperDoc Preview..."
+  info "Installing SuperDoc..."
   echo ""
 
   detect_platform
@@ -370,6 +350,7 @@ main() {
   setup_api_key
   create_wrappers
   install_skill
+  setup_mcp
   setup_path
   print_success
 }
