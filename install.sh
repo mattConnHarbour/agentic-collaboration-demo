@@ -112,7 +112,7 @@ install_binaries() {
   fi
 
   # Install MCP wrapper script
-  local mcp_wrapper_url="https://raw.githubusercontent.com/$REPO/claude-desktop/bin/superdoc-mcp-wrapper.js"
+  local mcp_wrapper_url="https://raw.githubusercontent.com/$REPO/claude-desktop/scripts/superdoc-mcp-wrapper.js"
   download_file "$mcp_wrapper_url" "$INSTALL_DIR/superdoc-mcp-wrapper.js"
   chmod +x "$INSTALL_DIR/superdoc-mcp-wrapper.js"
   info "Installed MCP wrapper"
