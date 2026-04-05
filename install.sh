@@ -111,6 +111,12 @@ install_binaries() {
     info "Installed assets"
   fi
 
+  # Install MCP wrapper script
+  local mcp_wrapper_url="https://raw.githubusercontent.com/$REPO/claude-desktop/bin/superdoc-mcp-wrapper.js"
+  download_file "$mcp_wrapper_url" "$INSTALL_DIR/superdoc-mcp-wrapper.js"
+  chmod +x "$INSTALL_DIR/superdoc-mcp-wrapper.js"
+  info "Installed MCP wrapper"
+
   # Cleanup
   rm -rf "$tmp_dir"
 }
@@ -295,6 +301,28 @@ curl -fsSL https://raw.githubusercontent.com/mattConnHarbour/agentic-collaborati
 ```
 
 If preview mode shows API errors, set the API key (see Setup section above).
+
+## MCP Server Configuration (Optional)
+
+For native Claude Desktop integration via MCP, add this to your Claude Desktop config:
+
+**macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "superdoc": {
+      "command": "node",
+      "args": ["~/superdoc/bin/superdoc-mcp-wrapper.js"],
+      "env": {
+        "SUPERDOC_HOME": "~/superdoc"
+      }
+    }
+  }
+}
+```
+
+The MCP wrapper keeps the server alive across Claude Desktop reconnects.
 
 ## IMPORTANT REMINDERS
 
