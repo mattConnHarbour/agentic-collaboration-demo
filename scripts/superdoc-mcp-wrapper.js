@@ -12,7 +12,7 @@ const os = require('os');
 const readline = require('readline');
 
 // --- Configuration ---
-const SUPERDOC_HOME = process.env.SUPERDOC_HOME || path.join(os.homedir(), 'superdoc');
+const SUPERDOC_HOME = process.env.SUPERDOC_HOME || path.join(os.homedir(), 'superdoc', 'claude');
 const MCP_COMMAND = process.env.MCP_COMMAND || 'npx';
 const MCP_ARGS = process.env.MCP_ARGS ? process.env.MCP_ARGS.split(' ') : ['@superdoc-dev/mcp'];
 const SOCKET = process.env.MCP_SOCKET || '/tmp/superdoc-mcp.sock';

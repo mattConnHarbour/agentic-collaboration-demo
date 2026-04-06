@@ -12,8 +12,8 @@ import Anthropic from '@anthropic-ai/sdk';
 if (!process.env.SUPERDOC_CLI_BIN) {
   const execDir = dirname(process.execPath);
   const candidates = [
-    join(execDir, '..', 'assets', 'bin', 'superdoc'),  // ~/superdoc/assets/bin/superdoc
-    join(execDir, 'superdoc-bin'),                      // ~/superdoc/bin/superdoc-bin
+    join(execDir, '..', 'assets', 'bin', 'superdoc'),  // ~/superdoc/claude/assets/bin/superdoc
+    join(execDir, 'superdoc-bin'),                      // ~/superdoc/claude/bin/superdoc-bin
     join(execDir, 'node_modules/@superdoc-dev/sdk-darwin-arm64/bin/superdoc'),  // dev mode
   ];
   for (const path of candidates) {

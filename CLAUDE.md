@@ -347,3 +347,112 @@ Cloudflare Pages                         Railway
 - Server serves static files from `client/dist` if available (bundled mode)
 - Client uses `VITE_BACKEND_URL` env var for backend connections (falls back to `localhost:3050` for dev)
 - Agent is integrated into server process (no separate spawn needed)
+
+## Claude Desktop Integration (WIP)
+
+A new simplified installation for Claude Desktop users is being developed.
+
+### Target Architecture
+
+```
+Claude Desktop                              Browser
+┌─────────────────────┐                    ┌─────────────────┐
+│ MCP Tools           │                    │ Preview App     │
+│ (via keepalive)     │                    │ (Vue + Editor)  │
+└─────────┬───────────┘                    └────────┬────────┘
+          │                                         │
+          ▼                                         ▼
+┌─────────────────────┐                    ┌─────────────────┐
+│ mcp-wrapper.js      │                    │ server.ts       │
+│ (daemon pattern)    │                    │ (self-daemon)   │
+└─────────┬───────────┘                    └────────┬────────┘
+          │                                         │
+          ▼                                         ▼
+┌─────────────────────┐                    ┌─────────────────┐
+│ npx @superdoc/mcp   │                    │ Collaboration   │
+│ (real MCP server)   │                    │ + AI Agent      │
+└─────────────────────┘                    └─────────────────┘
+```
+
+### Installation Directory Structure
+
+```
+~/superdoc/claude/
+├── .env                    # ANTHROPIC_API_KEY (user-provided)
+├── mcp-wrapper.js          # MCP keepalive daemon wrapper
+├── preview.pid             # Current preview server PID
+└── preview/
+    ├── server.js           # Preview server (compiled)
+    ├── agent.js            # AI agent
+    ├── job.js              # Job management
+    ├── package.json
+    └── node_modules/       # Dependencies (@superdoc-dev/sdk, etc.)
+```
+
+### Install Script
+
+Single curl command installs everything:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mattConnHarbour/agentic-collaboration-demo/claude-desktop/superdoc-setup.sh | bash
+```
+
+The script:
+1. Downloads MCP wrapper and preview server code
+2. Runs `npm install` for dependencies
+3. Configures Claude Desktop MCP (`~/Library/Application Support/Claude/claude_desktop_config.json`)
+4. Installs skill to `~/.claude/skills/superdoc/skill.md`
+
+### Key Design Decisions
+
+1. **No bundled binary** - Uses Node.js directly since npm/npx is required anyway
+2. **MCP keepalive wrapper** - Daemon pattern keeps MCP server alive across Claude Desktop reconnects
+3. **Self-daemonizing preview** - Preview server forks to background so Claude doesn't block
+4. **Dynamic port selection** - Server picks available port to avoid conflicts
+5. **Graceful API key handling** - Preview works without key, chat disabled with tooltip
+
+### Pending Server Enhancements
+
+The preview server (`server/server.ts`) needs these updates:
+
+1. **Self-daemonize pattern** - Parent spawns detached child and exits immediately
+2. **Dynamic port selection** - Find available port, write to PID file
+3. **PID file management** - Kill old server before starting new one
+4. **WebSocket disconnect cleanup** - 30s grace period before shutting down
+5. **Inactivity timeout** - Shutdown after 5min with no connections
+6. **File watching** - Track mtime to detect external changes vs internal saves
+7. **API key check endpoint** - `/api/has-key` for client to check availability
+
+### Pending Client Enhancements
+
+The Vue client needs:
+
+1. **Disabled chat UI** - When no API key, show tooltip explaining why
+2. **File changed banner** - When external changes detected, offer reload
+
+### Skill File
+
+Simplified skill at `~/.claude/skills/superdoc/skill.md`:
+
+```markdown
+# SuperDoc
+
+Edit Word documents (.docx) using MCP tools (automatic).
+
+## Preview in Browser
+
+node ~/superdoc/claude/preview/server.js /path/to/document.docx
+
+## Set API Key (for AI chat in preview)
+
+echo "ANTHROPIC_API_KEY=sk-ant-..." > ~/superdoc/claude/.env
+```
+
+### Files to Create/Update
+
+- `superdoc-setup.sh` - Main install script (CREATED, needs completion)
+- `scripts/superdoc-mcp-wrapper.js` - MCP keepalive wrapper (needs update for ~/superdoc/claude/.env)
+- `server/server.ts` - Preview server (needs all enhancements)
+- `client/src/App.vue` - Vue client (needs disabled chat + file banner)
+- Remove `install.sh` - Old binary-based installer
+- Remove `.github/workflows/release.yml` - Old binary release workflow

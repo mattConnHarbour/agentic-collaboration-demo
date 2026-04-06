@@ -1,12 +1,74 @@
 import dotenv from 'dotenv';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, writeFileSync, unlinkSync, statSync, watch } from 'fs';
 import { dirname, join, resolve, basename } from 'path';
 import { homedir } from 'os';
+import { spawn } from 'child_process';
+import { createServer } from 'net';
+
+// ============================================================================
+// Self-Daemonize Pattern
+// ============================================================================
+// When run without --child flag, fork a detached child and exit immediately.
+// This allows Claude to run `node server.js /path/to/doc.docx` without blocking.
+
+const SUPERDOC_HOME = process.env.SUPERDOC_HOME || join(homedir(), 'superdoc', 'claude');
+const PID_FILE = join(SUPERDOC_HOME, 'preview.pid');
+
+if (!process.argv.includes('--child')) {
+  // Parent process: spawn child and exit
+  const args = ['--child', ...process.argv.slice(2)];
+  const child = spawn(process.execPath, [process.argv[1], ...args], {
+    detached: true,
+    stdio: 'ignore',
+    env: { ...process.env },
+  });
+  child.unref();
+
+  // Give child a moment to start and write PID file
+  setTimeout(() => {
+    if (existsSync(PID_FILE)) {
+      try {
+        const pidData = JSON.parse(readFileSync(PID_FILE, 'utf-8'));
+        console.log(`[SuperDoc] Preview server started at http://localhost:${pidData.port}`);
+      } catch {
+        console.log('[SuperDoc] Preview server starting...');
+      }
+    } else {
+      console.log('[SuperDoc] Preview server starting...');
+    }
+    process.exit(0);
+  }, 500);
+
+  // Don't continue with the rest of the script in parent
+  await new Promise(() => {}); // Block forever (will exit in setTimeout above)
+}
+
+// ============================================================================
+// Child Process - Actual Server
+// ============================================================================
+
+// Kill any existing preview server
+function killExistingServer(): void {
+  if (existsSync(PID_FILE)) {
+    try {
+      const pidData = JSON.parse(readFileSync(PID_FILE, 'utf-8'));
+      process.kill(pidData.pid, 'SIGTERM');
+      console.log(`[Server] Killed existing server (PID ${pidData.pid})`);
+    } catch {
+      // Process already dead or invalid PID file
+    }
+    try {
+      unlinkSync(PID_FILE);
+    } catch {}
+  }
+}
+
+killExistingServer();
 
 // Load .env from multiple locations: installed (~superdoc/.env) or dev (../.env)
 // Explicitly read and parse to ensure it works in GUI app context
 const envPaths = [
-  join(homedir(), 'superdoc', '.env'),  // installed mode
+  join(homedir(), 'superdoc', 'claude', '.env'),  // installed mode
   join(dirname(process.execPath), '..', '.env'),  // relative to binary
   '../.env',  // dev mode
 ];
@@ -40,10 +102,31 @@ for (const envPath of envPaths) {
   }
 }
 
+// Check if API key is available
+const hasApiKey = !!process.env.ANTHROPIC_API_KEY;
+
 // Also try dotenv as fallback
 dotenv.config({ path: '../.env' });
 import { fileURLToPath } from 'url';
 import { exec } from 'child_process';
+
+// ============================================================================
+// Dynamic Port Selection
+// ============================================================================
+
+async function findAvailablePort(startPort: number): Promise<number> {
+  return new Promise((resolve) => {
+    const server = createServer();
+    server.listen(startPort, '0.0.0.0', () => {
+      const port = (server.address() as any).port;
+      server.close(() => resolve(port));
+    });
+    server.on('error', () => {
+      // Port in use, try next
+      resolve(findAvailablePort(startPort + 1));
+    });
+  });
+}
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import websocketPlugin from '@fastify/websocket';
@@ -86,7 +169,7 @@ if (!isStandaloneBinary || hasExternalCli) {
 // ============================================================================
 
 function parseArgs(): { file?: string; port: number; noBrowser: boolean } {
-  const args = process.argv.slice(2);
+  const args = process.argv.slice(2).filter(arg => arg !== '--child');
   let file: string | undefined;
   let port = parseInt(process.env.PORT || '3050', 10);
   let noBrowser = false;
@@ -107,6 +190,127 @@ function parseArgs(): { file?: string; port: number; noBrowser: boolean } {
 
   return { file, port, noBrowser };
 }
+
+// ============================================================================
+// Connection & Activity Tracking
+// ============================================================================
+
+let activeConnections = 0;
+let lastActivity = Date.now();
+const DISCONNECT_GRACE_PERIOD = 30 * 1000; // 30 seconds
+const INACTIVITY_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+let shutdownTimer: ReturnType<typeof setTimeout> | null = null;
+
+function recordActivity() {
+  lastActivity = Date.now();
+  if (shutdownTimer) {
+    clearTimeout(shutdownTimer);
+    shutdownTimer = null;
+  }
+}
+
+function checkShutdown() {
+  if (activeConnections === 0) {
+    const timeSinceActivity = Date.now() - lastActivity;
+    if (timeSinceActivity >= INACTIVITY_TIMEOUT) {
+      console.log('[Server] Inactivity timeout - shutting down');
+      cleanup();
+      process.exit(0);
+    } else {
+      // Schedule shutdown check
+      const timeUntilShutdown = INACTIVITY_TIMEOUT - timeSinceActivity;
+      shutdownTimer = setTimeout(checkShutdown, Math.min(timeUntilShutdown, 60000));
+    }
+  }
+}
+
+function onConnectionOpen() {
+  activeConnections++;
+  recordActivity();
+  console.log(`[Server] Connection opened (active: ${activeConnections})`);
+}
+
+function onConnectionClose() {
+  activeConnections--;
+  console.log(`[Server] Connection closed (active: ${activeConnections})`);
+  if (activeConnections === 0) {
+    // Start grace period timer
+    setTimeout(() => {
+      if (activeConnections === 0) {
+        checkShutdown();
+      }
+    }, DISCONNECT_GRACE_PERIOD);
+  }
+}
+
+// ============================================================================
+// File Watching
+// ============================================================================
+
+let lastKnownMtime: number | null = null;
+let fileWatcher: ReturnType<typeof watch> | null = null;
+let fileChangedExternally = false;
+
+function startFileWatching(filePath: string) {
+  try {
+    lastKnownMtime = statSync(filePath).mtimeMs;
+  } catch {
+    lastKnownMtime = null;
+  }
+
+  fileWatcher = watch(filePath, (eventType) => {
+    if (eventType === 'change') {
+      try {
+        const currentMtime = statSync(filePath).mtimeMs;
+        if (lastKnownMtime !== null && currentMtime !== lastKnownMtime) {
+          // File changed - check if it was us or external
+          const timeSinceActivity = Date.now() - lastActivity;
+          if (timeSinceActivity > 2000) {
+            // More than 2 seconds since last activity - likely external change
+            console.log('[Server] File changed externally');
+            fileChangedExternally = true;
+          }
+          lastKnownMtime = currentMtime;
+        }
+      } catch {}
+    }
+  });
+
+  console.log(`[Server] Watching file: ${filePath}`);
+}
+
+function updateFileMtime(filePath: string) {
+  try {
+    lastKnownMtime = statSync(filePath).mtimeMs;
+    fileChangedExternally = false;
+  } catch {}
+}
+
+// ============================================================================
+// Cleanup
+// ============================================================================
+
+function cleanup() {
+  if (fileWatcher) {
+    fileWatcher.close();
+    fileWatcher = null;
+  }
+  try {
+    unlinkSync(PID_FILE);
+  } catch {}
+}
+
+process.on('SIGTERM', () => {
+  console.log('[Server] Received SIGTERM');
+  cleanup();
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('[Server] Received SIGINT');
+  cleanup();
+  process.exit(0);
+});
 
 const cliArgs = parseArgs();
 
@@ -299,8 +503,14 @@ const SuperDocCollaboration = new CollaborationBuilder()
 
 async function main() {
   const fastify = Fastify({ logger: false });
-  const port = cliArgs.port;
+
+  // Dynamic port selection
+  const port = await findAvailablePort(cliArgs.port);
   const collaborationUrl = `ws://localhost:${port}/collaboration`;
+
+  // Write PID file with port info
+  writeFileSync(PID_FILE, JSON.stringify({ pid: process.pid, port, file: documentFilePath }));
+  console.log(`[Server] PID file written: ${PID_FILE}`);
 
   // Seed collaboration state from docx file if provided
   if (documentFilePath) {
@@ -335,11 +545,29 @@ async function main() {
   // Health check
   fastify.get('/health', async () => ({
     status: 'ok',
+    hasApiKey,
     versions: {
       sdk: sdkVersion,
       collab: collabVersion,
     },
   }));
+
+  // API key check endpoint
+  fastify.get('/api/has-key', async () => ({
+    hasKey: hasApiKey,
+  }));
+
+  // File status endpoint (for external change detection)
+  fastify.get('/api/file-status', async () => ({
+    changedExternally: fileChangedExternally,
+    path: documentFilePath,
+  }));
+
+  // Acknowledge external changes (client calls this after reloading)
+  fastify.post('/api/file-status/ack', async () => {
+    fileChangedExternally = false;
+    return { acknowledged: true };
+  });
 
   // Config endpoint - returns document URL for client
   fastify.get('/api/config', async (request) => {
@@ -388,8 +616,10 @@ async function main() {
 
     try {
       const body = request.body as Buffer;
-      const { writeFileSync } = await import('fs');
       writeFileSync(documentFilePath, body);
+      // Update our known mtime so we don't trigger "external change"
+      updateFileMtime(documentFilePath);
+      recordActivity();
       console.log(`[Server] Document saved: ${documentFileName} (${body.length} bytes)`);
       return { success: true, size: body.length };
     } catch (e) {
@@ -413,6 +643,13 @@ async function main() {
   fastify.get('/collaboration/:documentId', { websocket: true }, (socket, request) => {
     const documentId = (request.params as { documentId: string }).documentId;
     console.log(`[Server] Collaboration client connected: ${documentId}`);
+
+    // Track connection
+    onConnectionOpen();
+    socket.on('close', () => {
+      onConnectionClose();
+    });
+
     SuperDocCollaboration.welcome(socket as any, request as any);
   });
 
@@ -466,7 +703,12 @@ async function main() {
   // Create saver agent after server is listening (so collaboration WebSocket is available)
   if (documentFilePath) {
     await createSaverAgent('preview-session', collaborationUrl);
+    // Start file watching for external changes
+    startFileWatching(documentFilePath);
   }
+
+  // Start inactivity check timer
+  setTimeout(checkShutdown, INACTIVITY_TIMEOUT);
 
   const serverUrl = `http://localhost:${port}`;
 

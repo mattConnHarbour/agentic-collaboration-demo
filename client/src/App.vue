@@ -33,6 +33,11 @@ const backendVersions = ref({ sdk: null, collab: null });
 const currentToolCalls = ref([]);
 const chatContainer = ref(null);
 
+// API key and file status
+const hasApiKey = ref(true); // Assume true until we check
+const fileChangedExternally = ref(false);
+let fileStatusInterval = null;
+
 const USER_COLORS = ['#a11134', '#2a7e34', '#b29d11', '#2f4597', '#ab5b22'];
 
 // Truncate text for logging
@@ -317,7 +322,13 @@ const checkBackendHealth = async () => {
     const response = await fetch(`${backendUrl}/health`);
     const data = await response.json();
     if (data.status === 'ok') {
-      agentStatus.value = 'ready';
+      // Check if API key is available
+      hasApiKey.value = data.hasApiKey !== false;
+      if (hasApiKey.value) {
+        agentStatus.value = 'ready';
+      } else {
+        agentStatus.value = 'no-api-key';
+      }
       if (data.versions) {
         backendVersions.value = data.versions;
       }
@@ -332,15 +343,63 @@ const checkBackendHealth = async () => {
   }
 };
 
+// Check for external file changes
+const checkFileStatus = async () => {
+  try {
+    const response = await fetch(`${backendUrl}/api/file-status`);
+    const data = await response.json();
+    if (data.changedExternally && !fileChangedExternally.value) {
+      fileChangedExternally.value = true;
+      console.log('[Client] File changed externally');
+    }
+  } catch (e) {
+    // Ignore errors
+  }
+};
+
+// Reload document after external change
+const reloadDocument = async () => {
+  console.log('[Client] Reloading document...');
+  fileChangedExternally.value = false;
+
+  // Acknowledge the change
+  await fetch(`${backendUrl}/api/file-status/ack`, { method: 'POST' });
+
+  // Destroy and reinitialize SuperDoc
+  if (superdoc.value) {
+    superdoc.value.destroy();
+    superdoc.value = null;
+  }
+
+  // Small delay to ensure cleanup
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+  // Reinitialize
+  initSuperDoc();
+};
+
+// Dismiss the file changed banner without reloading
+const dismissFileChanged = async () => {
+  fileChangedExternally.value = false;
+  await fetch(`${backendUrl}/api/file-status/ack`, { method: 'POST' });
+};
+
 onMounted(async () => {
   await fetchConfig();
   initSuperDoc();
   checkBackendHealth();
+
+  // Poll for file changes every 2 seconds
+  fileStatusInterval = setInterval(checkFileStatus, 2000);
 });
 
 onBeforeUnmount(() => {
   superdoc.value?.destroy();
   superdoc.value = null;
+  if (fileStatusInterval) {
+    clearInterval(fileStatusInterval);
+    fileStatusInterval = null;
+  }
 });
 </script>
 
@@ -359,6 +418,14 @@ onBeforeUnmount(() => {
         </span>
       </div>
     </header>
+
+    <!-- File Changed Banner -->
+    <div v-if="fileChangedExternally" class="file-changed-banner">
+      <span class="banner-icon">⚠️</span>
+      <span class="banner-text">This file was modified by another application.</span>
+      <button class="banner-btn primary" @click="reloadDocument">Reload</button>
+      <button class="banner-btn" @click="dismissFileChanged">Dismiss</button>
+    </div>
 
     <div class="main-content">
       <!-- Editor Area -->
@@ -381,7 +448,7 @@ onBeforeUnmount(() => {
           </div>
           <div class="agent-status" :class="agentStatus">
             <span class="status-dot"></span>
-            <span>{{ agentStatus === 'thinking' ? 'Thinking...' : agentStatus === 'working' ? 'Working...' : agentStatus === 'ready' ? 'Ready' : agentStatus === 'disconnected' ? 'Disconnected' : 'Offline' }}</span>
+            <span>{{ agentStatus === 'thinking' ? 'Thinking...' : agentStatus === 'working' ? 'Working...' : agentStatus === 'ready' ? 'Ready' : agentStatus === 'no-api-key' ? 'No API Key' : agentStatus === 'disconnected' ? 'Disconnected' : 'Offline' }}</span>
           </div>
           <!-- Hidden version pills (kept for future use)
           <div class="version-pills">
@@ -450,23 +517,29 @@ onBeforeUnmount(() => {
         </div>
 
         <!-- Chat Input -->
-        <div class="chat-input-area">
-          <input
-            type="text"
-            v-model="chatInput"
-            @keydown="handleKeydown"
-            placeholder="Ask the agent..."
-            :disabled="agentStatus !== 'ready'"
-          />
-          <button
-            class="send-btn"
-            @click="sendMessage()"
-            :disabled="!chatInput.trim() || agentStatus !== 'ready'"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
-            </svg>
-          </button>
+        <div class="chat-input-area" :class="{ 'no-api-key': !hasApiKey }">
+          <div v-if="!hasApiKey" class="no-api-key-message">
+            <span class="lock-icon">🔒</span>
+            <span>Add ANTHROPIC_API_KEY to ~/superdoc/.env to enable AI chat</span>
+          </div>
+          <template v-else>
+            <input
+              type="text"
+              v-model="chatInput"
+              @keydown="handleKeydown"
+              placeholder="Ask the agent..."
+              :disabled="agentStatus !== 'ready'"
+            />
+            <button
+              class="send-btn"
+              @click="sendMessage()"
+              :disabled="!chatInput.trim() || agentStatus !== 'ready'"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
+              </svg>
+            </button>
+          </template>
         </div>
       </aside>
     </div>
@@ -714,6 +787,10 @@ body {
   background: #ef4444;
 }
 
+.agent-status.no-api-key .status-dot {
+  background: #f59e0b;
+}
+
 .version-pills {
   display: flex;
   gap: 6px;
@@ -912,6 +989,75 @@ body {
 .send-btn:disabled {
   background: #cbd5e1;
   cursor: not-allowed;
+}
+
+/* File Changed Banner */
+.file-changed-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 24px;
+  background: #fef3c7;
+  border-bottom: 1px solid #f59e0b;
+  flex-shrink: 0;
+}
+
+.banner-icon {
+  font-size: 1.2rem;
+}
+
+.banner-text {
+  flex: 1;
+  font-size: 0.9rem;
+  color: #92400e;
+  font-weight: 500;
+}
+
+.banner-btn {
+  padding: 6px 14px;
+  border: 1px solid #d97706;
+  border-radius: 6px;
+  background: white;
+  color: #92400e;
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.banner-btn:hover {
+  background: #fef3c7;
+}
+
+.banner-btn.primary {
+  background: #f59e0b;
+  border-color: #f59e0b;
+  color: white;
+}
+
+.banner-btn.primary:hover {
+  background: #d97706;
+}
+
+/* No API Key Message */
+.chat-input-area.no-api-key {
+  background: #f8fafc;
+}
+
+.no-api-key-message {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: #fef3c7;
+  border-radius: 8px;
+  font-size: 0.8rem;
+  color: #92400e;
+  width: 100%;
+}
+
+.lock-icon {
+  font-size: 1rem;
 }
 
 /* Responsive */
