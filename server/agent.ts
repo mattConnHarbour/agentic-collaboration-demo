@@ -88,7 +88,7 @@ function loadTools(): Anthropic.Tool[] {
     : null;
   const assetsPath = join(execDir, '..', 'assets', 'tools', 'tools.anthropic.json'); // ~/superdoc/assets/tools/
   const bundledPath = join(execDir, 'tools', 'tools.anthropic.json');
-  const devPath = join(__dirname, 'node_modules/@superdoc-dev/sdk/tools/tools.anthropic.json');
+  const devPath = join(__dirname, '..', 'node_modules/@superdoc-dev/sdk/tools/tools.anthropic.json');
 
   const toolsPath = (installedPath && existsSync(installedPath)) ? installedPath
     : existsSync(assetsPath) ? assetsPath

@@ -17,6 +17,16 @@ const MCP_COMMAND = process.env.MCP_COMMAND || 'npx';
 const MCP_ARGS = process.env.MCP_ARGS ? process.env.MCP_ARGS.split(' ') : ['@superdoc-dev/mcp'];
 const SOCKET = process.env.MCP_SOCKET || '/tmp/superdoc-mcp.sock';
 const PID_FILE = SOCKET + '.pid';
+const LOG_FILE = path.join(SUPERDOC_HOME, 'mcp-wrapper.log');
+
+// Simple logging function
+function log(msg) {
+  const timestamp = new Date().toISOString();
+  const line = `[${timestamp}] ${msg}\n`;
+  try {
+    fs.appendFileSync(LOG_FILE, line);
+  } catch {}
+}
 
 // Load API key from ~/superdoc/.env if it exists
 function loadEnvFile() {
@@ -45,24 +55,39 @@ function loadEnvFile() {
 // DAEMON MODE
 // =====================
 if (process.argv.includes('--daemon')) {
+  log('DAEMON: Starting daemon mode');
   loadEnvFile();
 
   // Clean up stale socket
   try { fs.unlinkSync(SOCKET); } catch {}
 
   // Spawn the real MCP server
+  log(`DAEMON: Spawning MCP server: ${MCP_COMMAND} ${MCP_ARGS.join(' ')}`);
   const mcp = spawn(MCP_COMMAND, MCP_ARGS, {
-    stdio: ['pipe', 'pipe', 'inherit'],
+    stdio: ['pipe', 'pipe', 'pipe'], // Capture stderr too
     env: { ...process.env },
   });
 
+  // Log MCP server stderr
+  mcp.stderr.on('data', (data) => {
+    log(`DAEMON: MCP stderr: ${data.toString().trim()}`);
+  });
+
   fs.writeFileSync(PID_FILE, String(process.pid));
+  log(`DAEMON: PID file written: ${process.pid}`);
 
   let currentClient = null;
 
-  // Forward MCP server stdout → current client
+  // Forward MCP server stdout → current client (filter non-JSON lines)
   const serverReader = readline.createInterface({ input: mcp.stdout, crlfDelay: Infinity });
   serverReader.on('line', (line) => {
+    const trimmed = line.trim();
+    // Only forward lines that look like JSON (MCP protocol requires JSON-RPC)
+    if (!trimmed.startsWith('{')) {
+      log(`DAEMON: MCP stdout (filtered, non-JSON): ${line.substring(0, 100)}`);
+      return;
+    }
+    log(`DAEMON: MCP → client: ${line.substring(0, 100)}...`);
     if (currentClient && !currentClient.destroyed) {
       currentClient.write(line + '\n');
     }
@@ -70,8 +95,10 @@ if (process.argv.includes('--daemon')) {
 
   // Accept connections from wrapper clients
   const server = net.createServer((conn) => {
+    log('DAEMON: New client connected');
     // Replace the active client
     if (currentClient && !currentClient.destroyed) {
+      log('DAEMON: Replacing existing client');
       currentClient.destroy();
     }
     currentClient = conn;
@@ -79,35 +106,45 @@ if (process.argv.includes('--daemon')) {
     // Forward client stdin → MCP server
     const clientReader = readline.createInterface({ input: conn, crlfDelay: Infinity });
     clientReader.on('line', (line) => {
+      log(`DAEMON: client → MCP: ${line.substring(0, 100)}...`);
       if (!mcp.killed) {
         mcp.stdin.write(line + '\n');
       }
     });
 
     conn.on('close', () => {
+      log('DAEMON: Client connection closed');
       clientReader.close();
       if (currentClient === conn) currentClient = null;
     });
 
-    conn.on('error', () => {});
+    conn.on('error', (err) => {
+      log(`DAEMON: Client connection error: ${err.message}`);
+    });
   });
 
   server.listen(SOCKET);
+  log(`DAEMON: Listening on ${SOCKET}`);
 
   // Cleanup on exit
-  function cleanup() {
+  function cleanup(reason) {
+    log(`DAEMON: Cleanup triggered: ${reason}`);
     try { fs.unlinkSync(SOCKET); } catch {}
     try { fs.unlinkSync(PID_FILE); } catch {}
     if (!mcp.killed) mcp.kill();
     process.exit();
   }
 
-  process.on('SIGTERM', cleanup);
-  process.on('SIGINT', cleanup);
-  mcp.on('exit', cleanup);
+  process.on('SIGTERM', () => cleanup('SIGTERM'));
+  process.on('SIGINT', () => cleanup('SIGINT'));
+  mcp.on('exit', (code, signal) => {
+    log(`DAEMON: MCP process exited with code=${code} signal=${signal}`);
+    cleanup('mcp-exit');
+  });
 
-  // Keep daemon alive
-  process.stdin.resume();
+  // Keep daemon alive with setInterval instead of stdin
+  setInterval(() => {}, 60000);
+  log('DAEMON: Daemon ready and waiting');
 
   return;
 }
@@ -116,18 +153,27 @@ if (process.argv.includes('--daemon')) {
 // CLIENT MODE (default)
 // =====================
 
+log('CLIENT: Starting client mode');
+
 function isDaemonRunning() {
-  if (!fs.existsSync(PID_FILE)) return false;
+  if (!fs.existsSync(PID_FILE)) {
+    log('CLIENT: No PID file found');
+    return false;
+  }
   try {
     const pid = parseInt(fs.readFileSync(PID_FILE, 'utf8'));
     process.kill(pid, 0); // signal 0 = check if alive
-    return fs.existsSync(SOCKET);
-  } catch {
+    const socketExists = fs.existsSync(SOCKET);
+    log(`CLIENT: Daemon check - PID ${pid} alive, socket exists: ${socketExists}`);
+    return socketExists;
+  } catch (e) {
+    log(`CLIENT: Daemon check failed: ${e.message}`);
     return false;
   }
 }
 
 function startDaemon() {
+  log('CLIENT: Starting new daemon');
   loadEnvFile();
 
   const daemon = spawn(process.execPath, [__filename, '--daemon'], {
@@ -144,9 +190,11 @@ function startDaemon() {
   }
 
   if (!fs.existsSync(SOCKET)) {
+    log('CLIENT: Daemon failed to start - socket not found');
     process.stderr.write('superdoc-mcp-wrapper: daemon failed to start\n');
     process.exit(1);
   }
+  log('CLIENT: Daemon started successfully');
 }
 
 // Start daemon if needed
@@ -155,15 +203,28 @@ if (!isDaemonRunning()) {
 }
 
 // Connect to daemon and proxy stdio
+log('CLIENT: Connecting to daemon socket');
 const conn = net.connect(SOCKET);
+
+conn.on('connect', () => {
+  log('CLIENT: Connected to daemon');
+});
 
 process.stdin.pipe(conn);
 conn.pipe(process.stdout);
 
 conn.on('error', (err) => {
+  log(`CLIENT: Connection error: ${err.message}`);
   process.stderr.write('superdoc-mcp-wrapper: connection error: ' + err.message + '\n');
   process.exit(1);
 });
 
-conn.on('close', () => process.exit(0));
-process.stdin.on('end', () => conn.end());
+conn.on('close', () => {
+  log('CLIENT: Connection closed');
+  process.exit(0);
+});
+
+process.stdin.on('end', () => {
+  log('CLIENT: stdin ended');
+  conn.end();
+});

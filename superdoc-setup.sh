@@ -19,8 +19,32 @@ info() { echo -e "${GREEN}[superdoc]${NC} $1"; }
 warn() { echo -e "${YELLOW}[superdoc]${NC} $1"; }
 error() { echo -e "${RED}[superdoc]${NC} $1"; exit 1; }
 
+# Load shell environment (for nvm, Homebrew, etc.)
+load_shell_env() {
+  # Temporarily disable exit-on-error (sourced files may have non-zero returns)
+  set +e
+
+  # Source common shell configs for PATH
+  [ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" 2>/dev/null
+  [ -f "$HOME/.zshrc" ] && source "$HOME/.zshrc" 2>/dev/null
+  [ -f "$HOME/.profile" ] && source "$HOME/.profile" 2>/dev/null
+
+  # Load nvm if installed
+  export NVM_DIR="$HOME/.nvm"
+  [ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh" 2>/dev/null
+
+  # Add Homebrew paths
+  [ -d "/opt/homebrew/bin" ] && export PATH="/opt/homebrew/bin:$PATH"
+  [ -d "/usr/local/bin" ] && export PATH="/usr/local/bin:$PATH"
+
+  # Re-enable exit-on-error
+  set -e
+}
+
 # Check for required tools
 check_requirements() {
+  load_shell_env
+
   if ! command -v node &> /dev/null; then
     error "Node.js is required. Install from https://nodejs.org"
   fi
@@ -61,12 +85,23 @@ install_preview() {
   # Copy server directory
   cp -r "$tmp_dir/agentic-collaboration-demo-$BRANCH/server/"* "$SUPERDOC_HOME/preview/"
 
-  # Install dependencies and build
-  info "Installing dependencies (this may take a moment)..."
+  # Copy client directory
+  mkdir -p "$SUPERDOC_HOME/preview/client"
+  cp -r "$tmp_dir/agentic-collaboration-demo-$BRANCH/client/"* "$SUPERDOC_HOME/preview/client/"
+
+  # Install server dependencies and build
+  info "Installing server dependencies..."
   cd "$SUPERDOC_HOME/preview" && npm install --silent
 
   info "Building server..."
   cd "$SUPERDOC_HOME/preview" && npm run build:ts --silent 2>/dev/null || true
+
+  # Install client dependencies and build
+  info "Installing client dependencies..."
+  cd "$SUPERDOC_HOME/preview/client" && npm install --silent
+
+  info "Building client..."
+  cd "$SUPERDOC_HOME/preview/client" && npm run build --silent 2>/dev/null || true
 
   # Cleanup
   rm -rf "$tmp_dir"

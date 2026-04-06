@@ -197,31 +197,24 @@ function parseArgs(): { file?: string; port: number; noBrowser: boolean } {
 
 let activeConnections = 0;
 let lastActivity = Date.now();
-const DISCONNECT_GRACE_PERIOD = 30 * 1000; // 30 seconds
 const INACTIVITY_TIMEOUT = 5 * 60 * 1000; // 5 minutes
-let shutdownTimer: ReturnType<typeof setTimeout> | null = null;
 
 function recordActivity() {
   lastActivity = Date.now();
-  if (shutdownTimer) {
-    clearTimeout(shutdownTimer);
-    shutdownTimer = null;
-  }
 }
 
-function checkShutdown() {
-  if (activeConnections === 0) {
+function scheduleShutdownCheck() {
+  setTimeout(() => {
     const timeSinceActivity = Date.now() - lastActivity;
     if (timeSinceActivity >= INACTIVITY_TIMEOUT) {
       console.log('[Server] Inactivity timeout - shutting down');
       cleanup();
       process.exit(0);
     } else {
-      // Schedule shutdown check
-      const timeUntilShutdown = INACTIVITY_TIMEOUT - timeSinceActivity;
-      shutdownTimer = setTimeout(checkShutdown, Math.min(timeUntilShutdown, 60000));
+      // Check again later
+      scheduleShutdownCheck();
     }
-  }
+  }, 60000); // Check every minute
 }
 
 function onConnectionOpen() {
@@ -233,14 +226,6 @@ function onConnectionOpen() {
 function onConnectionClose() {
   activeConnections--;
   console.log(`[Server] Connection closed (active: ${activeConnections})`);
-  if (activeConnections === 0) {
-    // Start grace period timer
-    setTimeout(() => {
-      if (activeConnections === 0) {
-        checkShutdown();
-      }
-    }, DISCONNECT_GRACE_PERIOD);
-  }
 }
 
 // ============================================================================
@@ -355,7 +340,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const execDir = dirname(process.execPath);
 
 // Detect if running as bundled binary (check if __dirname is virtual bun path)
-const isBundled = __dirname.startsWith('/$bunfs') || !existsSync(join(__dirname, 'package.json'));
+// Also check parent dir for package.json (handles running from dist/)
+const isBundled = __dirname.startsWith('/$bunfs') ||
+  (!existsSync(join(__dirname, 'package.json')) && !existsSync(join(__dirname, '..', 'package.json')));
 
 // In bundled/installed mode, assets are at ../assets/ relative to binary
 // In dev mode, use the normal project structure
@@ -479,6 +466,7 @@ const handleAutoSave = async (params: CollaborationParams): Promise<void> => {
       try {
         const saved = await saverAgent.saveToFile(documentFilePath);
         if (saved) {
+          updateFileMtime(documentFilePath);  // Prevent "external change" detection
           console.log(`[Server] Auto-saved to disk: ${documentFilePath}`);
         }
       } catch (e) {
@@ -529,9 +517,9 @@ async function main() {
   );
 
   // Serve static files from client dist
-  // Check in order: env var, installed (assets/client), dev (client/dist)
+  // Check in order: env var, serverRoot/client/dist (installed), projectRoot/client/dist (dev)
   const clientDistPath = process.env.SUPERDOC_CLIENT_DIR
-    || (existsSync(join(projectRoot, 'assets/client')) ? join(projectRoot, 'assets/client') : null)
+    || (existsSync(join(serverRoot, 'client/dist')) ? join(serverRoot, 'client/dist') : null)
     || (existsSync(join(projectRoot, 'client/dist')) ? join(projectRoot, 'client/dist') : null);
 
   if (clientDistPath && existsSync(clientDistPath)) {
@@ -644,7 +632,6 @@ async function main() {
     const documentId = (request.params as { documentId: string }).documentId;
     console.log(`[Server] Collaboration client connected: ${documentId}`);
 
-    // Track connection
     onConnectionOpen();
     socket.on('close', () => {
       onConnectionClose();
@@ -708,7 +695,7 @@ async function main() {
   }
 
   // Start inactivity check timer
-  setTimeout(checkShutdown, INACTIVITY_TIMEOUT);
+  scheduleShutdownCheck();
 
   const serverUrl = `http://localhost:${port}`;
 

@@ -520,7 +520,7 @@ onBeforeUnmount(() => {
         <div class="chat-input-area" :class="{ 'no-api-key': !hasApiKey }">
           <div v-if="!hasApiKey" class="no-api-key-message">
             <span class="lock-icon">🔒</span>
-            <span>Add ANTHROPIC_API_KEY to ~/superdoc/.env to enable AI chat</span>
+            <span>To enable AI chat, ask Claude: "Set my SuperDoc API key to sk-ant-..."</span>
           </div>
           <template v-else>
             <input
