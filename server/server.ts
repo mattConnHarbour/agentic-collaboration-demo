@@ -302,6 +302,13 @@ const cliArgs = parseArgs();
 // Resolve file path if provided
 let documentFilePath: string | undefined;
 let documentFileName: string | undefined;
+let currentRoomId = 'preview-session';
+
+function generateRoomId(filename: string): string {
+  // Simple hash from filename + timestamp
+  const hash = Math.random().toString(36).substring(2, 8);
+  return `preview-${filename.replace(/\W/g, '')}-${hash}`;
+}
 
 if (cliArgs.file) {
   documentFilePath = resolve(cliArgs.file);
@@ -562,9 +569,52 @@ async function main() {
     const config = {
       documentUrl: documentFilePath ? `/api/document` : null,
       documentName: documentFileName || null,
+      roomId: currentRoomId,
     };
     console.log(`[Server] GET /api/config -> ${JSON.stringify(config)}`);
     return config;
+  });
+
+  // Upload a new document (saves to ~/Downloads and restarts with it)
+  fastify.post('/upload', async (request, reply) => {
+    const filename = (request.query as { filename?: string }).filename || 'uploaded.docx';
+    const body = request.body as Buffer;
+
+    console.log(`[Server] Upload received: filename=${filename}, bodyType=${typeof body}, bodyLength=${body?.length}, isBuffer=${Buffer.isBuffer(body)}`);
+
+    if (!body || body.length === 0) {
+      reply.code(400);
+      return { error: 'No file data received' };
+    }
+
+    // Save to ~/Downloads (avoid overwriting existing files)
+    const downloadsDir = join(homedir(), 'Downloads');
+    let savePath = join(downloadsDir, filename);
+
+    // If file exists, add random suffix until we find a unique name
+    while (existsSync(savePath)) {
+      const ext = filename.includes('.') ? '.' + filename.split('.').pop() : '';
+      const nameWithoutExt = filename.replace(/\.[^/.]+$/, '');
+      const randomSuffix = Math.floor(1000 + Math.random() * 9000); // 4-digit number
+      const newFilename = `${nameWithoutExt}-${randomSuffix}${ext}`;
+      savePath = join(downloadsDir, newFilename);
+    }
+
+    writeFileSync(savePath, body);
+
+    console.log(`[Server] Saved to: ${savePath} (${body.length} bytes)`);
+
+    // Update document state with actual saved filename
+    documentFilePath = savePath;
+    documentFileName = basename(savePath);
+
+    // Generate new room ID and seed collaboration state
+    currentRoomId = generateRoomId(documentFileName);
+    await seedCollaborationState(documentFilePath, currentRoomId);
+
+    console.log(`[Server] Switched to: ${documentFileName} (room: ${currentRoomId})`);
+
+    return { path: savePath, name: documentFileName, roomId: currentRoomId };
   });
 
   // Serve the document file

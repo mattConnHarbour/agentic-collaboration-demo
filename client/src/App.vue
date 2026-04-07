@@ -36,7 +36,62 @@ const chatContainer = ref(null);
 // API key and file status
 const hasApiKey = ref(true); // Assume true until we check
 const fileChangedExternally = ref(false);
+const fileInput = ref(null);
 let fileStatusInterval = null;
+
+// Upload/Download handlers
+const triggerUpload = () => {
+  fileInput.value?.click();
+};
+
+const handleFileUpload = async (event) => {
+  const file = event.target.files?.[0];
+  if (!file) return;
+
+  try {
+    const arrayBuffer = await file.arrayBuffer();
+    const response = await fetch(`${backendUrl}/upload?filename=${encodeURIComponent(file.name)}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      },
+      body: arrayBuffer,
+    });
+
+    if (response.ok) {
+      // Server switched to new document with new roomId - reload page to reinitialize
+      window.location.reload();
+    } else {
+      console.error('[Client] Upload failed:', response.status);
+    }
+  } catch (e) {
+    console.error('[Client] Upload error:', e);
+  }
+
+  // Reset input so same file can be uploaded again
+  event.target.value = '';
+};
+
+const downloadDocument = async () => {
+  if (!serverConfig.value?.documentUrl) return;
+
+  try {
+    const response = await fetch(serverConfig.value.documentUrl);
+    if (!response.ok) throw new Error('Download failed');
+
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = serverConfig.value.documentName || 'document.docx';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    console.error('[Client] Download error:', e);
+  }
+};
 
 const USER_COLORS = ['#a11134', '#2a7e34', '#b29d11', '#2f4597', '#ab5b22'];
 
@@ -69,6 +124,12 @@ const fetchConfig = async () => {
     console.log('[Client] Config received:', config);
 
     serverConfig.value = config;
+
+    // Update room ID if provided
+    if (config.roomId) {
+      roomId.value = config.roomId;
+      console.log('[Client] Room ID set to:', config.roomId);
+    }
 
     if (config.documentUrl) {
       // Construct full URL for the document
@@ -416,6 +477,9 @@ onBeforeUnmount(() => {
         <span class="save-status" :class="saveStatus">
           {{ saveStatus === 'saving' ? 'Saving...' : saveStatus === 'modified' ? 'Modified' : 'Saved' }}
         </span>
+        <input type="file" ref="fileInput" accept=".docx" @change="handleFileUpload" style="display: none" />
+        <button class="header-btn" @click="triggerUpload" title="Upload document">Upload</button>
+        <button class="header-btn" @click="downloadDocument" title="Download document">Download</button>
       </div>
     </header>
 
@@ -611,16 +675,17 @@ body {
 }
 
 .header-btn {
-  width: 36px;
-  height: 36px;
-  padding: 0;
+  height: 32px;
+  padding: 0 12px;
   display: flex;
   align-items: center;
   justify-content: center;
   background: #f1f5f9;
   border: 1px solid #e5e7eb;
-  border-radius: 8px;
+  border-radius: 6px;
   color: #64748b;
+  font-size: 13px;
+  font-weight: 500;
   cursor: pointer;
   transition: all 0.15s;
 }
