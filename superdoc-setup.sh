@@ -108,6 +108,26 @@ install_preview() {
   info "Installed preview server"
 }
 
+# Install preview wrapper script
+install_preview_wrapper() {
+  mkdir -p "$SUPERDOC_HOME/bin"
+
+  cat > "$SUPERDOC_HOME/bin/preview" << 'WRAPPER'
+#!/bin/bash
+
+# Load node into PATH (handles nvm, Homebrew, standard installs)
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh" 2>/dev/null
+export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
+
+# Run the preview server with all arguments passed through
+node ~/superdoc/claude/preview/dist/server.js "$@"
+WRAPPER
+
+  chmod +x "$SUPERDOC_HOME/bin/preview"
+  info "Installed preview wrapper"
+}
+
 # Create env file
 setup_env() {
   local env_file="$SUPERDOC_HOME/.env"
@@ -194,7 +214,7 @@ Just ask Claude to edit, modify, or update any .docx file.
 To open a document for visual preview in browser:
 
 ```bash
-node ~/superdoc/claude/preview/dist/server.js /absolute/path/to/document.docx
+~/superdoc/claude/bin/preview /absolute/path/to/document.docx
 ```
 
 The preview opens in your browser with:
@@ -217,7 +237,7 @@ echo "ANTHROPIC_API_KEY=sk-ant-..." > ~/superdoc/claude/.env
 | Request | Action |
 |---------|--------|
 | "Edit report.docx" | MCP tools (automatic) |
-| "Preview report.docx" | `node ~/superdoc/claude/preview/dist/server.js /path/to/report.docx` |
+| "Preview report.docx" | `~/superdoc/claude/bin/preview /path/to/report.docx` |
 | "Set API key to sk-ant-..." | Write to ~/superdoc/claude/.env |
 EOF
 
@@ -252,6 +272,7 @@ main() {
   setup_dirs
   install_mcp_wrapper
   install_preview
+  install_preview_wrapper
   setup_env
   setup_mcp_config
   install_skill
