@@ -348,11 +348,19 @@ Cloudflare Pages                         Railway
 - Client uses `VITE_BACKEND_URL` env var for backend connections (falls back to `localhost:3050` for dev)
 - Agent is integrated into server process (no separate spawn needed)
 
-## Claude Desktop Integration (WIP)
+## Claude Desktop Integration
 
-A new simplified installation for Claude Desktop users is being developed.
+Installation for Claude Desktop users that provides MCP tools for document editing and a browser-based preview.
 
-### Target Architecture
+### Install Command
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mattConnHarbour/agentic-collaboration-demo/claude-desktop/superdoc-setup.sh | bash
+```
+
+After install, restart Claude Desktop (Cmd+Q, reopen).
+
+### Architecture
 
 ```
 Claude Desktop                              Browser
@@ -363,13 +371,13 @@ Claude Desktop                              Browser
           │                                         │
           ▼                                         ▼
 ┌─────────────────────┐                    ┌─────────────────┐
-│ mcp-wrapper.js      │                    │ server.ts       │
-│ (daemon pattern)    │                    │ (self-daemon)   │
+│ mcp-wrapper.js      │                    │ bin/preview     │
+│ (daemon pattern)    │                    │ (shell wrapper) │
 └─────────┬───────────┘                    └────────┬────────┘
           │                                         │
           ▼                                         ▼
 ┌─────────────────────┐                    ┌─────────────────┐
-│ npx @superdoc/mcp   │                    │ Collaboration   │
+│ npx @superdoc/mcp   │                    │ server.ts       │
 │ (real MCP server)   │                    │ + AI Agent      │
 └─────────────────────┘                    └─────────────────┘
 ```
@@ -381,78 +389,83 @@ Claude Desktop                              Browser
 ├── .env                    # ANTHROPIC_API_KEY (user-provided)
 ├── mcp-wrapper.js          # MCP keepalive daemon wrapper
 ├── preview.pid             # Current preview server PID
+├── bin/
+│   └── preview             # Shell wrapper for preview server (handles PATH/nvm)
 └── preview/
-    ├── server.js           # Preview server (compiled)
-    ├── agent.js            # AI agent
-    ├── job.js              # Job management
+    ├── dist/
+    │   ├── server.js       # Preview server (compiled)
+    │   └── agent.js        # AI agent
+    ├── client/
+    │   └── dist/           # Vue client (built)
     ├── package.json
     └── node_modules/       # Dependencies (@superdoc-dev/sdk, etc.)
 ```
 
-### Install Script
+### Preview Command
 
-Single curl command installs everything:
+The preview wrapper handles PATH issues (nvm, Homebrew) that occur when Claude Desktop spawns bash:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mattConnHarbour/agentic-collaboration-demo/claude-desktop/superdoc-setup.sh | bash
+~/superdoc/claude/bin/preview /absolute/path/to/document.docx
 ```
 
-The script:
-1. Downloads MCP wrapper and preview server code
-2. Runs `npm install` for dependencies
-3. Configures Claude Desktop MCP (`~/Library/Application Support/Claude/claude_desktop_config.json`)
-4. Installs skill to `~/.claude/skills/superdoc/skill.md`
+Features:
+- Upload/download buttons for document management
+- AI chat assistant (if API key configured)
+- Auto-save with file watching
+- Dynamic room IDs for document switching
 
-### Key Design Decisions
+### Key Components
 
-1. **No bundled binary** - Uses Node.js directly since npm/npx is required anyway
-2. **MCP keepalive wrapper** - Daemon pattern keeps MCP server alive across Claude Desktop reconnects
-3. **Self-daemonizing preview** - Preview server forks to background so Claude doesn't block
-4. **Dynamic port selection** - Server picks available port to avoid conflicts
-5. **Graceful API key handling** - Preview works without key, chat disabled with tooltip
+1. **MCP Wrapper** (`mcp-wrapper.js`)
+   - Daemon pattern keeps MCP server alive across Claude Desktop reconnects
+   - Filters non-JSON stdout (telemetry) to prevent JSON-RPC protocol corruption
+   - Known issue: Old daemons accumulate on reconnect, causing CPU usage. Fix: `pkill -f "superdoc-mcp"`
 
-### Pending Server Enhancements
+2. **Preview Server** (`server/server.ts`)
+   - Self-daemonizes (parent spawns child, exits immediately)
+   - Loads .env from `~/superdoc/claude/.env`
+   - Dynamic room IDs for upload/document switching
+   - Auto-save with mtime tracking to prevent false "modified externally" warnings
 
-The preview server (`server/server.ts`) needs these updates:
+3. **Preview Wrapper** (`bin/preview`)
+   - Shell script that loads nvm/Homebrew PATH before running node
+   - Needed because Claude Desktop Code mode spawns bash without full shell environment
 
-1. **Self-daemonize pattern** - Parent spawns detached child and exits immediately
-2. **Dynamic port selection** - Find available port, write to PID file
-3. **PID file management** - Kill old server before starting new one
-4. **WebSocket disconnect cleanup** - 30s grace period before shutting down
-5. **Inactivity timeout** - Shutdown after 5min with no connections
-6. **File watching** - Track mtime to detect external changes vs internal saves
-7. **API key check endpoint** - `/api/has-key` for client to check availability
+4. **Skill File** (`~/.claude/skills/superdoc/skill.md`)
+   - Tells Claude Desktop how to use MCP tools and preview
+   - Note: Skills are guidance, not enforcement - Claude may try alternative approaches
 
-### Pending Client Enhancements
+### Known Issues
 
-The Vue client needs:
+1. **MCP daemon accumulation** - Old daemons don't clean up on reconnect
+   - Symptom: High CPU/fan activity
+   - Fix: `pkill -f "superdoc-mcp" && pkill -f "mcp-wrapper"`
+   - TODO: Add PID file check to kill existing daemon before starting new one
 
-1. **Disabled chat UI** - When no API key, show tooltip explaining why
-2. **File changed banner** - When external changes detected, offer reload
+2. **Preview PATH issues in Code mode** - Claude Desktop Code mode doesn't reliably use the wrapper
+   - Symptom: Claude tries various node paths, eventually works after multiple attempts
+   - Workaround: Explicitly tell Claude to run `~/superdoc/claude/bin/preview /path/to/file.docx`
 
-### Skill File
+3. **Agent first-try failures** - Agent may not respond on first chat request
+   - Likely cause: Y.js sync timing after WebSocket connects
+   - Workaround: Send message again
 
-Simplified skill at `~/.claude/skills/superdoc/skill.md`:
+### Uninstall
 
-```markdown
-# SuperDoc
-
-Edit Word documents (.docx) using MCP tools (automatic).
-
-## Preview in Browser
-
-node ~/superdoc/claude/preview/server.js /path/to/document.docx
-
-## Set API Key (for AI chat in preview)
-
-echo "ANTHROPIC_API_KEY=sk-ant-..." > ~/superdoc/claude/.env
+```bash
+rm -rf ~/superdoc/claude
+rm -rf ~/.claude/skills/superdoc
+rm ~/Library/Application\ Support/Claude/claude_desktop_config.json
+pkill -f "superdoc-mcp"
+pkill -f "mcp-wrapper"
 ```
 
-### Files to Create/Update
+### Development
 
-- `superdoc-setup.sh` - Main install script (CREATED, needs completion)
-- `scripts/superdoc-mcp-wrapper.js` - MCP keepalive wrapper (needs update for ~/superdoc/claude/.env)
-- `server/server.ts` - Preview server (needs all enhancements)
-- `client/src/App.vue` - Vue client (needs disabled chat + file banner)
-- Remove `install.sh` - Old binary-based installer
-- Remove `.github/workflows/release.yml` - Old binary release workflow
+Key files for Claude Desktop integration:
+- `superdoc-setup.sh` - Install script
+- `scripts/superdoc-mcp-wrapper.js` - MCP keepalive wrapper
+- `server/server.ts` - Preview server with self-daemon, upload/download, dynamic rooms
+- `server/agent.ts` - AI agent with Anthropic Claude
+- `client/src/App.vue` - Vue client with upload/download buttons
