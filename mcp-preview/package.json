@@ -1,0 +1,32 @@
+{
+  "name": "@mattconndev/superdoc-mcp-preview",
+  "version": "0.1.0",
+  "description": "MCP server for launching SuperDoc preview in browser",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "superdoc-mcp-preview": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "keywords": [
+    "mcp",
+    "superdoc",
+    "document-editor",
+    "preview"
+  ],
+  "author": "mattconndev",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mattConnHarbour/agentic-collaboration-demo"
+  }
+}
