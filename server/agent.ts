@@ -1,8 +1,8 @@
 /**
- * Agent class for document editing via SuperDoc SDK and OpenAI.
+ * Agent class for document editing via SuperDoc SDK and Anthropic Claude.
  */
 
-import OpenAI from 'openai';
+import Anthropic from '@anthropic-ai/sdk';
 import {
   createSuperDocClient,
   chooseTools,
@@ -16,29 +16,33 @@ const MAX_ITERATIONS = 20;
 
 export type ToolCallCallback = (name: string, args: Record<string, unknown>) => void;
 
+type MessageParam = Anthropic.MessageParam;
+type ToolUseBlock = Anthropic.ToolUseBlock;
+type Tool = Anthropic.Tool;
+
 export class Agent {
   private client: SuperDocClient | null = null;
   private doc: SuperDocDocument | null = null;
-  private openai: OpenAI;
-  private tools: OpenAI.ChatCompletionTool[] = [];
-  private conversationHistory: OpenAI.ChatCompletionMessageParam[] = [];
+  private anthropic: Anthropic;
+  private tools: Tool[] = [];
+  private conversationHistory: MessageParam[] = [];
+  private systemPrompt: string = '';
   private documentId: string;
   private collaborationUrl: string;
 
   constructor(documentId: string, collaborationUrl: string) {
     this.documentId = documentId;
     this.collaborationUrl = collaborationUrl;
-    this.openai = new OpenAI();
+    this.anthropic = new Anthropic();
   }
 
   async connect(): Promise<void> {
-    // Initialize conversation with system prompt
-    const systemPrompt = await getSystemPrompt();
-    this.conversationHistory = [{ role: 'system', content: systemPrompt }];
+    // Initialize system prompt
+    this.systemPrompt = await getSystemPrompt();
 
-    // Load tools
-    const { tools } = await chooseTools({ provider: 'openai' });
-    this.tools = tools as OpenAI.ChatCompletionTool[];
+    // Load tools for Anthropic
+    const { tools } = await chooseTools({ provider: 'anthropic' });
+    this.tools = tools as Tool[];
     console.log(`[Agent] Loaded ${this.tools.length} tools`);
 
     // Connect to document
@@ -63,52 +67,72 @@ export class Agent {
     console.log(`[Agent] Processing: ${userMessage}`);
     this.conversationHistory.push({ role: 'user', content: userMessage });
 
-    const messages: OpenAI.ChatCompletionMessageParam[] = [...this.conversationHistory];
+    const messages: MessageParam[] = [...this.conversationHistory];
 
     for (let i = 0; i < MAX_ITERATIONS; i++) {
-      const response = await this.openai.chat.completions.create({
-        model: 'gpt-4.1',
+      const response = await this.anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 4096,
+        system: this.systemPrompt,
         messages,
         tools: this.tools,
       });
 
-      const message = response.choices[0].message;
-      messages.push(message);
+      // Check if we have tool use
+      const toolUseBlocks = response.content.filter(
+        (block): block is ToolUseBlock => block.type === 'tool_use'
+      );
 
-      // No tool calls - we're done
-      if (!message.tool_calls?.length) {
-        const result = message.content || 'Done.';
+      // If no tool calls and we have text, we're done
+      if (toolUseBlocks.length === 0) {
+        const textBlock = response.content.find(block => block.type === 'text');
+        const result = textBlock?.type === 'text' ? textBlock.text : 'Done.';
         console.log(`[Agent] Response: ${result}`);
         this.conversationHistory.push({ role: 'assistant', content: result });
         return result;
       }
 
-      // Execute tool calls
-      for (const call of message.tool_calls) {
-        if (call.type !== 'function') continue;
+      // Add assistant message with tool use
+      messages.push({ role: 'assistant', content: response.content });
 
-        const args = JSON.parse(call.function.arguments);
-        console.log(`[Agent] Tool: ${call.function.name}`, args);
+      // Execute tool calls
+      const toolResults: Anthropic.ToolResultBlockParam[] = [];
+
+      for (const toolUse of toolUseBlocks) {
+        const args = toolUse.input as Record<string, unknown>;
+        console.log(`[Agent] Tool: ${toolUse.name}`, args);
 
         // Report tool call
-        onToolCall?.(call.function.name, args);
+        onToolCall?.(toolUse.name, args);
 
         try {
-          const result = await dispatchSuperDocTool(this.doc, call.function.name, args);
+          const result = await dispatchSuperDocTool(this.doc, toolUse.name, args);
           console.log(`[Agent] Result:`, result);
-          messages.push({
-            role: 'tool',
-            tool_call_id: call.id,
+          toolResults.push({
+            type: 'tool_result',
+            tool_use_id: toolUse.id,
             content: JSON.stringify(result),
           });
         } catch (error) {
           console.error(`[Agent] Error:`, error);
-          messages.push({
-            role: 'tool',
-            tool_call_id: call.id,
+          toolResults.push({
+            type: 'tool_result',
+            tool_use_id: toolUse.id,
             content: JSON.stringify({ error: String(error) }),
+            is_error: true,
           });
         }
+      }
+
+      // Add tool results
+      messages.push({ role: 'user', content: toolResults });
+
+      // Check stop reason
+      if (response.stop_reason === 'end_turn') {
+        const textBlock = response.content.find(block => block.type === 'text');
+        const result = textBlock?.type === 'text' ? textBlock.text : 'Done.';
+        this.conversationHistory.push({ role: 'assistant', content: result });
+        return result;
       }
     }
 
