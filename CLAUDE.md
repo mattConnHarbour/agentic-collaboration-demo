@@ -1,298 +1,239 @@
-# Agentic Collaboration Demo
+# Comment Review Agent Demo
 
-A chat-based AI agent that edits documents using the SuperDoc SDK and OpenAI. See the [README](./README.md) for setup instructions.
+An AI agent that processes document comments and applies tracked changes using the SuperDoc SDK and OpenAI.
+
+## Current Development State
+
+**Status**: In Progress - Core workflow implemented, debugging comment text retrieval
+
+### What Works
+- Vue client with SuperDoc editor and comment panel
+- "Request Review" button triggers server-side review
+- Server connects to document via SDK collaboration
+- `comments.list()` returns comments with anchored text and targets
+- `comments.get({ id })` fetches individual comment details
+- Job polling UI shows progress
+
+### Current Issue
+The `comments.list()` API returns comments but the `text` field (comment body/instruction) is empty. Attempted fix: fetch full details via `comments.get({ id })` - needs testing.
+
+**Last error**: `comments get: missing required --id` - fixed by changing `{ commentId }` to `{ id }`.
+
+### Next Steps
+1. Test if `comments.get({ id })` returns the comment `text` field
+2. If text is still empty, investigate why comment body isn't being stored/returned
+3. Complete the workflow: LLM revision → tracked change → reply to comment
 
 ## Architecture
 
 ```
-Vue Client (5173)          Collaboration Server (3050)          AI Agent
-┌─────────────────┐        ┌─────────────────────────┐        ┌─────────────────┐
-│ SuperDoc Editor │◄──────►│ /collaboration/:docId   │◄──────►│ SDK client.open │
-│ Chat Sidebar    │◄──────►│ /chat/:roomId           │◄──────►│ Chat WebSocket  │
-└─────────────────┘        └─────────────────────────┘        └─────────────────┘
+Vue Client (5173)              Server (3050)
+┌─────────────────────┐        ┌─────────────────────────────┐
+│ SuperDoc Editor     │◄──────►│ /collaboration/:docId (WS)  │
+│ Comment Panel       │        │ /review (POST) → job        │
+│ Request Review btn  │───────►│ /review/jobs/:id (GET)      │
+└─────────────────────┘        └─────────────────────────────┘
+                                         │
+                                         ▼
+                               ┌─────────────────────────────┐
+                               │ CommentReviewer             │
+                               │ - connects via SDK          │
+                               │ - lists comments            │
+                               │ - calls OpenAI for revision │
+                               │ - applies tracked change    │
+                               │ - replies to comment        │
+                               └─────────────────────────────┘
 ```
-
-- **Client**: Vue 3 app with SuperDoc editor and chat sidebar
-- **Server**: Fastify with WebSocket for collaboration (Yjs) and chat
-- **Agent**: Node.js process using SuperDoc SDK + OpenAI for document editing
 
 ## Project Structure
 
 ```
 client/
-  src/App.vue          Main Vue component with editor + chat
-  package.json         Vue/Vite dependencies
+  src/App.vue              Main Vue component with editor + review UI
+  package.json             Vue/Vite dependencies
 
 server/
-  server.ts            Fastify server with collaboration + chat endpoints
-  package.json         Server dependencies
+  server.ts                Fastify server with collaboration + review endpoints
+  comment-reviewer.ts      Core review logic (SDK + OpenAI)
+  package.json             Server dependencies (@superdoc-dev/sdk, openai)
 
-agent/
-  agent.ts             Main agent with agentic loop
-  chat.ts              Chat WebSocket client class
-  package.json         Agent dependencies (SDK, OpenAI)
-
-start.ts               Production entrypoint (spawns server + agent)
-.env                   Environment variables (OPENAI_API_KEY)
-package.json           Root scripts (dev, install:all, start)
+.env                       Environment variables (OPENAI_API_KEY)
+package.json               Root scripts (dev, install:all)
 ```
 
-## Key Patterns
+## Key Files
 
-### SDK Client Setup
+### `server/comment-reviewer.ts`
+
+Core review logic:
 
 ```typescript
-import { createSuperDocClient, chooseTools, dispatchSuperDocTool, getSystemPrompt } from '@superdoc-dev/sdk';
-
-const client = createSuperDocClient();
-await client.connect();
-
-const doc = await client.open({
-  collaboration: {
-    providerType: 'y-websocket',
-    url: 'ws://localhost:3050/collaboration',
-    documentId: 'my-doc',
-  },
-});
-```
-
-### Getting Tools for LLM
-
-```typescript
-const { tools } = await chooseTools({ provider: 'openai' });
-// Returns array of OpenAI-compatible tool definitions
-```
-
-**Note**: The npm SDK has a simple API - just `{ provider }`. No `mode`, `groups`, or other options.
-
-### System Prompt
-
-```typescript
-const systemPrompt = await getSystemPrompt();
-// Reads from SDK's system-prompt.md file (async because it reads from disk)
-```
-
-### Executing Tools
-
-```typescript
-const result = await dispatchSuperDocTool(doc, 'insert_content', {
-  value: 'Hello, world!',
-  type: 'text',
-});
-```
-
-### Agentic Loop Pattern
-
-```typescript
-const MAX_ITERATIONS = 20;  // Prevent infinite loops
-
-for (let i = 0; i < MAX_ITERATIONS; i++) {
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4.1',
-    messages,
-    tools,
-  });
-
-  const message = response.choices[0].message;
-  messages.push(message);
-
-  if (!message.tool_calls?.length) {
-    return message.content;  // Done - no more tool calls
-  }
-
-  for (const call of message.tool_calls) {
-    const result = await dispatchSuperDocTool(doc, call.function.name, JSON.parse(call.function.arguments));
-    messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) });
-  }
-}
-```
-
-### Two-Array Conversation Pattern
-
-The agent uses two arrays to manage conversation:
-
-- **`conversationHistory`**: Persistent array with system prompt + user messages + final assistant text responses (no tool calls)
-- **`messages`**: Working array built fresh each turn from `[...conversationHistory]`, accumulates tool calls during processing
-
-This keeps context clean - the LLM sees past conversation outcomes but not old tool call details.
-
-## SuperDoc Configuration
-
-### Layout Engine Options
-
-Use `layoutEngineOptions` instead of deprecated `pagination`:
-
-```javascript
-new SuperDoc({
-  // ...
-  layoutEngineOptions: {
-    flowMode: 'semantic',  // Continuous flow without pagination
-  },
-});
-```
-
-**Flow modes**:
-- `'paginated'` (default): Standard page-first layout
-- `'semantic'`: Continuous semantic flow without visible pagination boundaries
-
-### Toolbar Configuration
-
-```javascript
-new SuperDoc({
-  toolbar: '#superdoc-toolbar',
-  toolbarGroups: ['center'],  // Reduces toolbar size
-  modules: {
-    toolbar: {
-      excludeItems: ['link', 'table', 'image'],  // Remove specific buttons
-    },
-  },
-});
-```
-
-## Chat Serialization
-
-The `Chat` class uses a queue to serialize message processing:
-
-```typescript
-class Chat {
-  private processing = false;
-  private queue: string[] = [];
-
-  serve(handler) {
-    this.ws.on('message', (data) => {
-      // Queue messages instead of processing immediately
-      this.queue.push(msg.message.content);
-      this.processQueue(handler);
+export class CommentReviewer {
+  async connect(): Promise<void> {
+    this.client = createSuperDocClient();
+    await this.client.connect();
+    this.doc = await this.client.open({
+      collaboration: {
+        providerType: 'y-websocket',
+        url: this.collaborationUrl,
+        documentId: this.documentId,
+      },
     });
   }
 
-  private async processQueue(handler) {
-    if (this.processing) return;  // Already processing
-    this.processing = true;
-    while (this.queue.length > 0) {
-      const content = this.queue.shift();
-      await handler(content);  // Process one at a time
+  async review(onProgress?: (result: ReviewResult) => void): Promise<ReviewResult> {
+    // 1. List open, root-level comments
+    const commentsResult = await this.doc.comments.list({ includeResolved: false });
+    const rootComments = allComments.filter(c => !c.parentCommentId && c.status === 'open');
+
+    // 2. Process each comment
+    for (const comment of rootComments) {
+      // Fetch full details (list may not include text)
+      const fullComment = await this.doc.comments.get({ id: comment.id });
+
+      // 3. Generate revision via OpenAI
+      const { revisedText, explanation } = await this.generateRevision(
+        fullComment.anchoredText,
+        fullComment.text  // <-- This is the comment instruction
+      );
+
+      // 4. Apply tracked change
+      await this.doc.replace(
+        { target: fullComment.target, value: revisedText },
+        { changeMode: 'tracked' }
+      );
+
+      // 5. Reply to comment
+      await this.doc.comments.create({
+        text: `I've made this change...\n\n${explanation}`,
+        parentCommentId: comment.id,
+      });
     }
-    this.processing = false;
   }
 }
 ```
 
-This prevents concurrent requests from corrupting the shared conversation history.
+### `server/server.ts`
+
+Review endpoints:
+
+```typescript
+// POST /review - start a review job
+fastify.post('/review', async (request) => {
+  const { documentId } = request.body;
+  const jobId = crypto.randomUUID();
+
+  // Run review in background
+  const reviewer = new CommentReviewer(documentId, collaborationUrl);
+  await reviewer.connect();
+  reviewer.review((progress) => {
+    reviews.get(jobId).result = progress;
+  }).then(() => {
+    reviews.get(jobId).status = 'complete';
+    reviewer.disconnect();
+  });
+
+  return { jobId };
+});
+
+// GET /review/jobs/:jobId - poll for status
+fastify.get('/review/jobs/:jobId', async (request) => {
+  const job = reviews.get(jobId);
+  return { id: job.id, status: job.status, result: job.result };
+});
+```
+
+### `client/src/App.vue`
+
+Review UI (key parts):
+
+```javascript
+const requestReview = async () => {
+  reviewStatus.value = 'processing';
+  const response = await fetch(`${backendUrl}/review`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ documentId: roomId.value }),
+  });
+  const { jobId } = await response.json();
+  const result = await pollForReviewResult(jobId);
+  reviewResult.value = result;
+  reviewStatus.value = result.status;
+};
+
+const pollForReviewResult = async (jobId) => {
+  while (true) {
+    const response = await fetch(`${backendUrl}/review/jobs/${jobId}`);
+    const job = await response.json();
+    if (job.status === 'complete' || job.status === 'error') {
+      return job.result;
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+};
+```
+
+## SDK API Reference
+
+### Comments API
+
+```typescript
+// List comments (returns items without full text body)
+const result = await doc.comments.list({ includeResolved: false });
+// result.items[]: { id, status, anchoredText, target, parentCommentId, ... }
+
+// Get full comment details (includes text body)
+const comment = await doc.comments.get({ id: commentId });
+// comment: { id, text, anchoredText, target, status, ... }
+
+// Create comment or reply
+await doc.comments.create({
+  text: 'Comment body',
+  target: { kind: 'text', segments: [...] },  // for root comment
+  // OR
+  parentCommentId: 'xxx',  // for reply
+});
+```
+
+### Replace with Tracked Changes
+
+```typescript
+await doc.replace(
+  { target: comment.target, value: 'New text' },
+  { changeMode: 'tracked' }
+);
+```
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `OPENAI_API_KEY` | Yes | OpenAI API key for the agent |
-
-The `.env` file should be in the root of this example directory. The agent loads it with:
-
-```typescript
-dotenv.config({ path: join(__dirname, '..', '.env') });
-```
+| `OPENAI_API_KEY` | Yes | OpenAI API key for LLM revision |
 
 ## Scripts
 
 | Script | Description |
 |--------|-------------|
-| `npm run install:all` | Install dependencies for root + client + server + agent |
-| `npm run dev` | Run all components (server starts first, agent waits 2s) |
+| `npm run install:all` | Install dependencies for root + client + server |
+| `npm run dev` | Run client (5173) + server (3050) concurrently |
 | `npm run dev:server` | Run only the server |
 | `npm run dev:client` | Run only the Vue client |
-| `npm run dev:agent` | Run only the agent |
-| `npm run start` | Production: spawn server + agent via start.ts |
-| `npm run build` | Build Vue client for production |
 
 ## Common Issues
 
-### Agent shows "Offline"
-
-- Check terminal for errors
-- Verify `OPENAI_API_KEY` is set in `.env`
-- Ensure server is running before agent connects
-
-### Race condition on startup
-
-The dev script adds a 2-second delay before starting the agent:
-
-```json
-"dev": "concurrently \"npm run dev:server\" \"npm run dev:client\" \"sleep 2 && npm run dev:agent\""
+### Port already in use
+```bash
+lsof -ti:3050 | xargs -r kill -9
+lsof -ti:5173 | xargs -r kill -9
 ```
 
-### Tool loop runs forever
+### Comment text is empty
+The `comments.list()` API may not return the `text` field. Use `comments.get({ id })` to fetch full details.
 
-The agent has `MAX_ITERATIONS = 20` to prevent infinite tool-calling loops.
+### SDK parameter naming
+- Use `{ id }` not `{ commentId }` for `comments.get()`
+- Use `{ parentCommentId }` for replies in `comments.create()`
 
-### Concurrent requests corrupt history
+## Origin
 
-The Chat class queues messages and processes them sequentially.
-
-## SDK Version
-
-This example uses `@superdoc-dev/sdk@^1.1.0`. The SDK provides:
-
-- `createSuperDocClient()` - Create SDK client
-- `chooseTools({ provider })` - Get LLM tool definitions
-- `dispatchSuperDocTool(doc, name, args)` - Execute a tool
-- `getSystemPrompt()` - Get the recommended system prompt (async)
-
-## Collaboration Server
-
-The server uses `@superdoc-dev/superdoc-yjs-collaboration` with Fastify:
-
-```typescript
-const SuperDocCollaboration = new CollaborationBuilder()
-  .withName('SuperDoc Collaboration service')
-  .withDebounce(2000)
-  .onConfigure(handleConfig)
-  .onLoad(handleLoad)
-  .onAuthenticate(handleAuth)
-  .build();
-
-// WebSocket route
-fastify.get('/collaboration/:documentId', { websocket: true }, (socket, request) => {
-  SuperDocCollaboration.welcome(socket, request);
-});
-```
-
-The `onChange` and `onAutoSave` callbacks are optional and not needed for this example.
-
-## Deployment
-
-Split deployment: frontend on Cloudflare Pages, backend (server + agent) on Railway.
-
-```
-Cloudflare Pages                         Railway
-┌──────────────────┐                    ┌─────────────────────────────────┐
-│  Vue Client      │───── wss:// ──────►│  start.ts                       │
-│  (static)        │                    │  ├── server.ts (WS endpoints)   │
-│                  │                    │  └── agent.ts (SDK + OpenAI)    │
-└──────────────────┘                    └─────────────────────────────────┘
-```
-
-### Railway (Backend)
-
-1. New Project → Deploy from GitHub
-2. Configure:
-   - **Root Directory**: `examples/document-api/agentic-collaboration`
-   - **Build Command**: `npm run install:all`
-   - **Start Command**: `npm run start`
-3. Add environment variable: `OPENAI_API_KEY`
-4. Deploy → copy the generated URL (e.g., `https://xxx.up.railway.app`)
-
-### Cloudflare Pages (Frontend)
-
-1. Connect GitHub repo
-2. Configure:
-   - **Root Directory**: `examples/document-api/agentic-collaboration/client`
-   - **Build Command**: `npm install && npm run build`
-   - **Output Directory**: `dist`
-3. Add environment variable: `VITE_BACKEND_URL` = Railway URL (with `https://`)
-4. Deploy
-
-### How It Works
-
-- `start.ts` spawns server, waits for `/health` endpoint, then spawns agent
-- Client uses `VITE_BACKEND_URL` env var for WebSocket connections (falls back to `localhost:3050` for dev)
-- Agent connects to server via localhost (same Railway container)
+Cloned from https://github.com/mattConnHarbour/agentic-collaboration-demo and repurposed from chat-based editing to comment review workflow.

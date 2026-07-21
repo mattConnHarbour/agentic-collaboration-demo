@@ -18,6 +18,7 @@ import {
 
 import { Agent } from './agent.js';
 import { Job } from './job.js';
+import { CommentReviewer, type ReviewResult } from './comment-reviewer.js';
 
 // Get package versions
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -39,6 +40,27 @@ async function getOrCreateAgent(sessionId: string, documentId: string, collabora
     console.log(`[Server] Created agent for session: ${sessionId}`);
   }
   return agent;
+}
+
+// ============================================================================
+// Review Registry
+// ============================================================================
+
+interface ReviewJob {
+  id: string;
+  status: 'pending' | 'processing' | 'complete' | 'error';
+  result: ReviewResult | null;
+  createdAt: number;
+}
+
+const reviews = new Map<string, ReviewJob>();
+const REVIEW_TTL = 5 * 60 * 1000; // 5 minutes
+
+function cleanupReview(jobId: string): void {
+  setTimeout(() => {
+    reviews.delete(jobId);
+    console.log(`[Server] Cleaned up review: ${jobId}`);
+  }, REVIEW_TTL);
 }
 
 // ============================================================================
@@ -146,6 +168,85 @@ async function main() {
     }
 
     return job.toJSON();
+  });
+
+  // ============================================================================
+  // Review API (Comment Review)
+  // ============================================================================
+
+  // Trigger a comment review
+  fastify.post('/review', async (request) => {
+    const { documentId, commentInstructions = {} } = request.body as {
+      documentId: string;
+      commentInstructions?: Record<string, string>;
+    };
+
+    if (!documentId) {
+      return { error: 'Missing required field: documentId' };
+    }
+
+    const jobId = crypto.randomUUID();
+    const job: ReviewJob = {
+      id: jobId,
+      status: 'pending',
+      result: null,
+      createdAt: Date.now(),
+    };
+    reviews.set(jobId, job);
+
+    console.log(`[Server] Review job created: ${jobId} for document: ${documentId}`);
+
+    // Fire and forget - process asynchronously
+    (async () => {
+      job.status = 'processing';
+
+      const reviewer = new CommentReviewer(documentId, collaborationUrl, commentInstructions);
+      try {
+        await reviewer.connect();
+        const result = await reviewer.review((progress) => {
+          job.result = progress;
+        });
+        job.result = result;
+        job.status = result.status === 'error' ? 'error' : 'complete';
+        console.log(`[Server] Review job complete: ${jobId}`);
+      } catch (err: any) {
+        console.error(`[Server] Review job failed: ${jobId}`, err);
+        job.status = 'error';
+        job.result = {
+          status: 'error',
+          commentsFound: 0,
+          commentsProcessed: 0,
+          comments: [],
+          error: err.message,
+        };
+      } finally {
+        try {
+          await reviewer.disconnect();
+        } catch (err) {
+          // Cleanup must never terminate the long-running API process.
+          console.error(`[Server] Reviewer cleanup failed: ${jobId}`, err);
+        }
+        cleanupReview(jobId);
+      }
+    })();
+
+    return { jobId };
+  });
+
+  // Poll for review result
+  fastify.get('/review/jobs/:jobId', async (request) => {
+    const { jobId } = request.params as { jobId: string };
+    const job = reviews.get(jobId);
+
+    if (!job) {
+      return { error: 'Review job not found' };
+    }
+
+    return {
+      id: job.id,
+      status: job.status,
+      result: job.result,
+    };
   });
 
   // Start server

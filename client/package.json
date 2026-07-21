@@ -8,7 +8,7 @@
     "build": "vite build"
   },
   "dependencies": {
-    "superdoc": "^1.20.0",
+    "superdoc": "^1.45.0",
     "vue": "^3.5.13",
     "yjs": "13.6.19"
   },

@@ -1,6 +1,6 @@
 <script setup>
 import 'superdoc/style.css';
-import { onMounted, onBeforeUnmount, shallowRef, ref, nextTick } from 'vue';
+import { onMounted, onBeforeUnmount, shallowRef, ref } from 'vue';
 import { SuperDoc } from 'superdoc';
 
 const superdocVersion = __SUPERDOC_VERSION__;
@@ -31,10 +31,7 @@ const getOrCreateRoomId = () => {
     return roomParam;
   }
 
-  // Generate a random room ID
   const newRoomId = generateRoomId();
-
-  // Update URL without reload
   const url = new URL(window.location.href);
   url.searchParams.set('room', newRoomId);
   window.history.replaceState({}, '', url.toString());
@@ -45,35 +42,14 @@ const getOrCreateRoomId = () => {
 const roomId = ref(getOrCreateRoomId());
 const roomCopied = ref(false);
 
-// Generate a unique session ID for this browser session
-const SESSION_ID = crypto.randomUUID();
-
 const superdoc = shallowRef(null);
 
-// Chat state
-const chatMessages = ref([]);
-const chatInput = ref('');
-const agentStatus = ref('disconnected');
+// Review state
+const reviewStatus = ref('idle'); // 'idle' | 'reviewing' | 'complete' | 'error'
+const reviewResult = ref(null);
 const backendVersions = ref({ sdk: null, collab: null });
-const currentToolCalls = ref([]);
-const chatContainer = ref(null);
 
 const USER_COLORS = ['#a11134', '#2a7e34', '#b29d11', '#2f4597', '#ab5b22'];
-
-// Truncate text for logging
-const truncate = (text, max = 60) => text?.length > max ? text.slice(0, max) + '...' : text;
-
-// Hash string to consistent color
-const hashToColor = (str) => {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    hash = str.charCodeAt(i) + ((hash << 5) - hash);
-  }
-  const hue = Math.abs(hash) % 360;
-  return `hsl(${hue}, 60%, 90%)`;
-};
-
-const toolColor = (name) => ({ backgroundColor: hashToColor(name) });
 
 const initSuperDoc = () => {
   console.log('[Client] Initializing SuperDoc for room:', roomId.value);
@@ -81,7 +57,7 @@ const initSuperDoc = () => {
   superdoc.value = new SuperDoc({
     selector: '#superdoc',
     toolbar: '#superdoc-toolbar',
-    toolbarGroups: ['center'],
+    toolbarGroups: ['center', 'right'],
     document: {
       id: roomId.value,
       type: 'docx',
@@ -104,130 +80,87 @@ const initSuperDoc = () => {
   });
 };
 
-// Poll for job completion
-const pollForResult = async (jobId) => {
-  const pollInterval = 1000; // 1 second
-  const maxAttempts = 120; // 2 minutes max
+// Poll for review completion
+const pollForReviewResult = async (jobId) => {
+  const pollInterval = 1000;
+  const maxAttempts = 120;
 
   for (let i = 0; i < maxAttempts; i++) {
     try {
-      const response = await fetch(`${backendUrl}/chat/jobs/${jobId}`);
+      const response = await fetch(`${backendUrl}/review/jobs/${jobId}`);
       const job = await response.json();
 
-      console.log(`[Chat] Poll #${i + 1}: ${job.status}${job.toolCalls?.length ? ` (${job.toolCalls.length} tools)` : ''}`);
+      console.log(`[Review] Poll #${i + 1}: ${job.status}`);
 
-      // Update status based on job state
-      if (job.status === 'pending') {
-        agentStatus.value = 'thinking';
-      } else if (job.status === 'processing') {
-        agentStatus.value = 'working';
-      }
-
-      // Update tool calls
-      if (job.toolCalls?.length) {
-        currentToolCalls.value = job.toolCalls;
-        scrollToBottom();
+      // Update progress
+      if (job.result) {
+        reviewResult.value = job.result;
       }
 
       if (job.status === 'complete') {
-        console.log(`[Chat] Result: ${truncate(job.result)}`);
-        return { result: job.result, toolCalls: job.toolCalls || [] };
+        return job.result;
       } else if (job.status === 'error') {
-        console.log(`[Chat] Error: ${truncate(job.error)}`);
-        throw new Error(job.error || 'Unknown error');
+        throw new Error(job.result?.error || 'Review failed');
       }
 
-      // Still processing, wait and try again
       await new Promise(resolve => setTimeout(resolve, pollInterval));
     } catch (e) {
-      console.error('[Chat] Poll failed:', e);
+      console.error('[Review] Poll failed:', e);
       throw e;
     }
   }
 
-  throw new Error('Request timed out');
+  throw new Error('Review timed out');
 };
 
-const sendMessage = async (content) => {
-  const text = content || chatInput.value.trim();
-  if (!text || agentStatus.value === 'thinking') return;
+const requestReview = async () => {
+  if (reviewStatus.value === 'reviewing') return;
 
-  // Add user message to chat
-  const userMessage = {
-    id: `user-${Date.now()}`,
-    role: 'user',
-    content: text,
-    timestamp: Date.now(),
-  };
-  chatMessages.value.push(userMessage);
-  chatInput.value = '';
-  scrollToBottom();
-
-  // Set status to thinking and clear tool calls
-  agentStatus.value = 'thinking';
-  currentToolCalls.value = [];
+  reviewStatus.value = 'reviewing';
+  reviewResult.value = null;
 
   try {
-    console.log(`[Chat] Sending: ${truncate(text)}`);
+    console.log('[Review] Starting review for room:', roomId.value);
 
-    // Submit chat job
-    const response = await fetch(`${backendUrl}/chat`, {
+    // The headless SDK currently returns comment anchors but can omit the
+    // browser collaboration model's commentText field. Send the synchronized
+    // bodies as a fallback so the reviewer can still process each instruction.
+    const commentInstructions = Object.fromEntries(
+      (superdoc.value?.commentsStore?.commentsList || [])
+        .map((comment) => {
+          const values = typeof comment.getValues === 'function' ? comment.getValues() : comment;
+          const id = values.commentId || values.id;
+          const text = values.commentText || values.text || '';
+          return [id, text];
+        })
+        .filter(([id, text]) => id && text)
+    );
+
+    const response = await fetch(`${backendUrl}/review`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sessionId: SESSION_ID,
-        documentId: roomId.value,
-        prompt: text,
-      }),
+      body: JSON.stringify({ documentId: roomId.value, commentInstructions }),
     });
 
     const { jobId, error } = await response.json();
     if (error) throw new Error(error);
 
-    console.log(`[Chat] Job created: ${jobId}`);
+    console.log(`[Review] Job created: ${jobId}`);
 
-    // Poll for result
-    const { result, toolCalls } = await pollForResult(jobId);
-
-    // Add assistant message to chat
-    const assistantMessage = {
-      id: `assistant-${Date.now()}`,
-      role: 'assistant',
-      content: result,
-      toolCalls: toolCalls,
-      timestamp: Date.now(),
-    };
-    chatMessages.value.push(assistantMessage);
-    scrollToBottom();
+    const result = await pollForReviewResult(jobId);
+    reviewResult.value = result;
+    reviewStatus.value = 'complete';
+    console.log('[Review] Complete:', result);
   } catch (e) {
-    console.error('[Client] Chat error:', e);
-    // Add error message to chat
-    chatMessages.value.push({
-      id: `error-${Date.now()}`,
-      role: 'assistant',
-      content: `Error: ${e.message}`,
-      timestamp: Date.now(),
-    });
-    scrollToBottom();
-  } finally {
-    agentStatus.value = 'ready';
-    currentToolCalls.value = [];
+    console.error('[Review] Error:', e);
+    reviewStatus.value = 'error';
+    reviewResult.value = { error: e.message };
   }
 };
 
-const handleKeydown = (event) => {
-  if (event.key === 'Enter' && !event.shiftKey) {
-    event.preventDefault();
-    sendMessage();
-  }
-};
-
-const scrollToBottom = () => {
-  nextTick(() => {
-    if (chatContainer.value) {
-      chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
-    }
-  });
+const resetReview = () => {
+  reviewStatus.value = 'idle';
+  reviewResult.value = null;
 };
 
 const generateUserInfo = () => {
@@ -242,10 +175,6 @@ const generateUserInfo = () => {
 const getRandomUserColor = () => {
   const index = Math.floor(Math.random() * USER_COLORS.length);
   return USER_COLORS[index];
-};
-
-const formatTime = (timestamp) => {
-  return new Date(timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 };
 
 // File input ref for import
@@ -266,7 +195,6 @@ const onFileSelected = async (event) => {
     console.error('[Client] Import failed:', e);
   }
 
-  // Reset input so same file can be selected again
   event.target.value = '';
 };
 
@@ -300,17 +228,12 @@ const checkBackendHealth = async () => {
     const response = await fetch(`${backendUrl}/health`);
     const data = await response.json();
     if (data.status === 'ok') {
-      agentStatus.value = 'ready';
       if (data.versions) {
         backendVersions.value = data.versions;
       }
       console.log('[Client] Backend healthy:', data);
-    } else {
-      agentStatus.value = 'disconnected';
-      console.error('[Client] Backend unhealthy:', data);
     }
   } catch (e) {
-    agentStatus.value = 'disconnected';
     console.error('[Client] Backend unreachable:', e);
   }
 };
@@ -368,103 +291,144 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <!-- Agent Sidebar -->
-      <aside class="agent-sidebar">
-        <div class="agent-header">
-          <div class="agent-title">
-            <svg class="agent-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+      <!-- Review Sidebar -->
+      <aside class="review-sidebar">
+        <div class="review-header">
+          <div class="review-title">
+            <svg class="review-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
             </svg>
-            <span>Document Agent</span>
+            <span>Comment Review</span>
             <a v-if="backendVersions.sdk" class="version-pill" :href="`https://www.npmjs.com/package/@superdoc-dev/sdk/v/${backendVersions.sdk}`" target="_blank">sdk {{ backendVersions.sdk }}</a>
           </div>
-          <div class="agent-status" :class="agentStatus">
-            <span class="status-dot"></span>
-            <span>{{ agentStatus === 'thinking' ? 'Thinking...' : agentStatus === 'working' ? 'Working...' : agentStatus === 'ready' ? 'Ready' : agentStatus === 'disconnected' ? 'Disconnected' : 'Offline' }}</span>
-          </div>
-          <!-- Hidden version pills (kept for future use)
-          <div class="version-pills">
-            <a class="version-pill" :href="`https://www.npmjs.com/package/superdoc/v/${superdocVersion}`" target="_blank">client {{ superdocVersion }}</a>
-            <a v-if="backendVersions.collab" class="version-pill" :href="`https://www.npmjs.com/package/@superdoc-dev/superdoc-yjs-collaboration/v/${backendVersions.collab}`" target="_blank">collab {{ backendVersions.collab }}</a>
-          </div>
-          -->
+          <p class="review-description">
+            Add comments to the document, then click "Request Review" to have the AI agent process each comment and apply tracked changes.
+          </p>
         </div>
 
-        <!-- Chat Messages -->
-        <div class="chat-messages" ref="chatContainer">
-          <div
-            v-for="msg in chatMessages"
-            :key="msg.id"
-            class="chat-message"
-            :class="msg.role"
-          >
-            <div class="message-avatar">
-              <div v-if="msg.role === 'user'" class="avatar user-avatar">
-                <svg viewBox="0 0 640 640" fill="currentColor">
-                  <path d="M320 312C386.3 312 440 258.3 440 192C440 125.7 386.3 72 320 72C253.7 72 200 125.7 200 192C200 258.3 253.7 312 320 312zM290.3 368C191.8 368 112 447.8 112 546.3C112 562.7 125.3 576 141.7 576L498.3 576C514.7 576 528 562.7 528 546.3C528 447.8 448.2 368 349.7 368L290.3 368z"/>
-                </svg>
-              </div>
-              <div v-else class="avatar agent-avatar">
-                <svg viewBox="0 0 640 640" fill="currentColor">
-                  <path d="M320 312C386.3 312 440 258.3 440 192C440 125.7 386.3 72 320 72C253.7 72 200 125.7 200 192C200 258.3 253.7 312 320 312zM290.3 368C191.8 368 112 447.8 112 546.3C112 562.7 125.3 576 141.7 576L498.3 576C514.7 576 528 562.7 528 546.3C528 447.8 448.2 368 349.7 368L290.3 368z"/>
-                </svg>
-              </div>
-            </div>
-            <div class="message-body">
-              <div class="message-header">
-                <span class="message-name">{{ msg.role === 'user' ? 'You' : 'Agent' }}</span>
-                <span class="message-time">{{ formatTime(msg.timestamp) }}</span>
-              </div>
-              <div v-if="msg.toolCalls?.length" class="tool-calls">
-                <div v-for="(tool, idx) in msg.toolCalls" :key="idx" class="tool-call" :style="toolColor(tool.name)">
-                  {{ tool.name }}
-                </div>
-              </div>
-              <div class="message-content">{{ msg.content }}</div>
+        <!-- Review Content -->
+        <div class="review-content">
+          <!-- Idle State -->
+          <div v-if="reviewStatus === 'idle'" class="review-idle">
+            <div class="review-instructions">
+              <h3>How it works:</h3>
+              <ol>
+                <li>Select text in the document</li>
+                <li>Add a comment with your instruction (e.g., "make this more formal")</li>
+                <li>Click "Request Review" below</li>
+                <li>The agent will apply tracked changes for each comment</li>
+              </ol>
             </div>
           </div>
 
-          <!-- Status indicator -->
-          <div v-if="agentStatus === 'thinking' || agentStatus === 'working'" class="chat-message assistant typing">
-            <div class="message-avatar">
-              <div class="avatar agent-avatar">
-                <svg viewBox="0 0 640 640" fill="currentColor">
-                  <path d="M320 312C386.3 312 440 258.3 440 192C440 125.7 386.3 72 320 72C253.7 72 200 125.7 200 192C200 258.3 253.7 312 320 312zM290.3 368C191.8 368 112 447.8 112 546.3C112 562.7 125.3 576 141.7 576L498.3 576C514.7 576 528 562.7 528 546.3C528 447.8 448.2 368 349.7 368L290.3 368z"/>
-                </svg>
+          <!-- Reviewing State -->
+          <div v-else-if="reviewStatus === 'reviewing'" class="review-progress">
+            <div class="progress-header">
+              <div class="spinner"></div>
+              <span>Reviewing comments...</span>
+            </div>
+
+            <div v-if="reviewResult" class="progress-stats">
+              <div class="stat">
+                <span class="stat-value">{{ reviewResult.commentsFound }}</span>
+                <span class="stat-label">Found</span>
+              </div>
+              <div class="stat">
+                <span class="stat-value">{{ reviewResult.commentsProcessed }}</span>
+                <span class="stat-label">Processed</span>
               </div>
             </div>
-            <div class="message-body">
-              <div class="message-header">
-                <span class="message-name">Agent</span>
-                <span class="typing-indicator">{{ agentStatus === 'thinking' ? 'thinking...' : 'working...' }}</span>
-              </div>
-              <!-- Tool calls -->
-              <div v-if="currentToolCalls.length" class="tool-calls">
-                <div v-for="(tool, idx) in currentToolCalls" :key="idx" class="tool-call" :style="toolColor(tool.name)">
-                  {{ tool.name }}
+
+            <div v-if="reviewResult?.comments?.length" class="comment-list">
+              <div
+                v-for="comment in reviewResult.comments"
+                :key="comment.commentId"
+                class="comment-item"
+                :class="comment.status"
+              >
+                <div class="comment-status-icon">
+                  <span v-if="comment.status === 'pending'" class="status-pending">-</span>
+                  <span v-else-if="comment.status === 'processing'" class="status-processing">...</span>
+                  <span v-else-if="comment.status === 'done'" class="status-done">&#10003;</span>
+                  <span v-else-if="comment.status === 'error'" class="status-error">&#10007;</span>
+                </div>
+                <div class="comment-info">
+                  <div class="comment-text">{{ comment.commentText || '(no text)' }}</div>
+                  <div class="comment-anchor">On: "{{ comment.anchoredText?.substring(0, 40) }}{{ comment.anchoredText?.length > 40 ? '...' : '' }}"</div>
+                  <div v-if="comment.error" class="comment-error">{{ comment.error }}</div>
                 </div>
               </div>
             </div>
           </div>
+
+          <!-- Complete State -->
+          <div v-else-if="reviewStatus === 'complete'" class="review-complete">
+            <div class="complete-header">
+              <svg class="complete-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                <polyline points="22 4 12 14.01 9 11.01"/>
+              </svg>
+              <span>Review Complete</span>
+            </div>
+
+            <div v-if="reviewResult" class="complete-stats">
+              <div class="stat">
+                <span class="stat-value">{{ reviewResult.commentsProcessed }}</span>
+                <span class="stat-label">Comments processed</span>
+              </div>
+            </div>
+
+            <div v-if="reviewResult?.comments?.length" class="comment-list">
+              <div
+                v-for="comment in reviewResult.comments"
+                :key="comment.commentId"
+                class="comment-item"
+                :class="comment.status"
+              >
+                <div class="comment-status-icon">
+                  <span v-if="comment.status === 'done'" class="status-done">&#10003;</span>
+                  <span v-else-if="comment.status === 'error'" class="status-error">&#10007;</span>
+                </div>
+                <div class="comment-info">
+                  <div class="comment-text">{{ comment.commentText || '(no text)' }}</div>
+                  <div v-if="comment.revisedText" class="comment-revised">
+                    Changed to: "{{ comment.revisedText.substring(0, 50) }}{{ comment.revisedText.length > 50 ? '...' : '' }}"
+                  </div>
+                  <div v-if="comment.error" class="comment-error">{{ comment.error }}</div>
+                </div>
+              </div>
+            </div>
+
+            <button class="reset-btn" @click="resetReview">Review More Comments</button>
+          </div>
+
+          <!-- Error State -->
+          <div v-else-if="reviewStatus === 'error'" class="review-error">
+            <div class="error-header">
+              <svg class="error-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"/>
+                <line x1="15" y1="9" x2="9" y2="15"/>
+                <line x1="9" y1="9" x2="15" y2="15"/>
+              </svg>
+              <span>Review Failed</span>
+            </div>
+            <p class="error-message">{{ reviewResult?.error || 'An unknown error occurred' }}</p>
+            <button class="reset-btn" @click="resetReview">Try Again</button>
+          </div>
         </div>
 
-        <!-- Chat Input -->
-        <div class="chat-input-area">
-          <input
-            type="text"
-            v-model="chatInput"
-            @keydown="handleKeydown"
-            placeholder="Ask the agent..."
-            :disabled="agentStatus !== 'ready'"
-          />
+        <!-- Action Button -->
+        <div class="review-action">
           <button
-            class="send-btn"
-            @click="sendMessage()"
-            :disabled="!chatInput.trim() || agentStatus !== 'ready'"
+            class="review-btn"
+            @click="requestReview"
+            :disabled="reviewStatus === 'reviewing'"
           >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
+            <svg v-if="reviewStatus !== 'reviewing'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
             </svg>
+            <span v-if="reviewStatus === 'reviewing'">Reviewing...</span>
+            <span v-else>Request Review</span>
           </button>
         </div>
       </aside>
@@ -557,18 +521,6 @@ body {
   color: #1e293b;
 }
 
-.avatar {
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 0.8rem;
-  font-weight: 600;
-  color: white;
-}
-
 /* Main Content */
 .main-content {
   flex: 1;
@@ -618,8 +570,8 @@ body {
   padding-bottom: 120px;
 }
 
-/* Agent Sidebar */
-.agent-sidebar {
+/* Review Sidebar */
+.review-sidebar {
   width: 360px;
   flex-shrink: 0;
   display: flex;
@@ -629,65 +581,33 @@ body {
   overflow: hidden;
 }
 
-.agent-header {
+.review-header {
   padding: 16px 20px;
   border-bottom: 1px solid #e5e7eb;
   flex-shrink: 0;
 }
 
-.agent-title {
+.review-title {
   display: flex;
   align-items: center;
   gap: 8px;
   font-size: 1rem;
   font-weight: 600;
   color: #1e293b;
-  margin-bottom: 6px;
+  margin-bottom: 8px;
 }
 
-.agent-icon {
+.review-icon {
   width: 20px;
   height: 20px;
   color: #3b82f6;
 }
 
-.agent-status {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+.review-description {
   font-size: 0.85rem;
   color: #64748b;
-}
-
-.status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #9ca3af;
-}
-
-.agent-status.ready .status-dot {
-  background: #22c55e;
-}
-
-.agent-status.thinking .status-dot {
-  background: #f59e0b;
-  animation: pulse 1.5s ease-in-out infinite;
-}
-
-.agent-status.working .status-dot {
-  background: #3b82f6;
-  animation: pulse 1.5s ease-in-out infinite;
-}
-
-.agent-status.disconnected .status-dot {
-  background: #ef4444;
-}
-
-.version-pills {
-  display: flex;
-  gap: 6px;
-  margin-top: 8px;
+  margin: 0;
+  line-height: 1.5;
 }
 
 .version-pill {
@@ -706,181 +626,254 @@ body {
   border-color: #3b82f6;
 }
 
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
-}
-
-/* Chat Messages */
-.chat-messages {
+/* Review Content */
+.review-content {
   flex: 1;
   overflow-y: auto;
-  padding: 16px;
+  padding: 16px 20px;
   min-height: 0;
 }
 
-.chat-message {
+.review-idle .review-instructions {
+  background: #f8fafc;
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.review-instructions h3 {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #1e293b;
+  margin: 0 0 12px 0;
+}
+
+.review-instructions ol {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 0.85rem;
+  color: #64748b;
+  line-height: 1.8;
+}
+
+/* Progress State */
+.review-progress .progress-header {
   display: flex;
+  align-items: center;
   gap: 12px;
   margin-bottom: 16px;
-}
-
-.message-avatar .avatar {
-  width: 36px;
-  height: 36px;
-  flex-shrink: 0;
-}
-
-.user-avatar {
-  background: #3b82f6;
-  color: white;
-}
-
-.user-avatar svg {
-  width: 18px;
-  height: 18px;
-}
-
-.agent-avatar {
-  background: #f1f5f9;
+  font-weight: 500;
   color: #3b82f6;
 }
 
-.agent-avatar svg {
-  width: 18px;
-  height: 18px;
+.spinner {
+  width: 20px;
+  height: 20px;
+  border: 2px solid #e5e7eb;
+  border-top-color: #3b82f6;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
 }
 
-.message-body {
-  flex: 1;
-  min-width: 0;
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
-.message-header {
+.progress-stats, .complete-stats {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 4px;
+  gap: 24px;
+  margin-bottom: 16px;
 }
 
-.message-name {
-  font-size: 0.875rem;
+.stat {
+  display: flex;
+  flex-direction: column;
+}
+
+.stat-value {
+  font-size: 1.5rem;
   font-weight: 600;
   color: #1e293b;
 }
 
-.message-time {
+.stat-label {
   font-size: 0.75rem;
-  color: #9ca3af;
+  color: #64748b;
 }
 
-.typing-indicator {
-  font-size: 0.8rem;
-  color: #3b82f6;
-  font-style: italic;
-}
-
-.tool-calls {
-  margin: 8px 0;
+/* Comment List */
+.comment-list {
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+  flex-direction: column;
+  gap: 12px;
 }
 
-.tool-call {
-  font-size: 0.75rem;
-  color: #374151;
-  padding: 2px 8px;
-  border-radius: 4px;
-  font-family: monospace;
-}
-
-
-.message-content {
-  font-size: 0.9rem;
-  color: #374151;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.chat-message.user .message-content {
-  background: #eff6ff;
-  padding: 10px 14px;
-  border-radius: 12px;
-  border-top-left-radius: 4px;
-}
-
-.chat-message.assistant .message-content {
+.comment-item {
+  display: flex;
+  gap: 12px;
+  padding: 12px;
   background: #f8fafc;
-  padding: 10px 14px;
-  border-radius: 12px;
-  border-top-left-radius: 4px;
-}
-
-/* Chat Input */
-.chat-input-area {
-  display: flex;
-  gap: 8px;
-  padding: 16px;
-  border-top: 1px solid #e5e7eb;
-  background: #fff;
-  flex-shrink: 0;
-}
-
-.chat-input-area input {
-  flex: 1;
-  padding: 10px 14px;
-  border: 1px solid #e5e7eb;
   border-radius: 8px;
-  font-size: 0.9rem;
-  color: #1e293b;
-  background: #f9fafb;
-  transition: all 0.15s;
+  border-left: 3px solid #e5e7eb;
 }
 
-.chat-input-area input::placeholder {
-  color: #9ca3af;
+.comment-item.done {
+  border-left-color: #22c55e;
 }
 
-.chat-input-area input:focus {
-  outline: none;
-  border-color: #3b82f6;
-  background: #fff;
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+.comment-item.error {
+  border-left-color: #ef4444;
 }
 
-.chat-input-area input:disabled {
-  background: #f1f5f9;
-  color: #9ca3af;
+.comment-item.processing {
+  border-left-color: #3b82f6;
 }
 
-.send-btn {
-  width: 40px;
-  height: 40px;
-  padding: 0;
+.comment-status-icon {
+  width: 24px;
+  height: 24px;
   display: flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
+}
+
+.status-pending {
+  color: #9ca3af;
+}
+
+.status-processing {
+  color: #3b82f6;
+}
+
+.status-done {
+  color: #22c55e;
+  font-weight: bold;
+}
+
+.status-error {
+  color: #ef4444;
+  font-weight: bold;
+}
+
+.comment-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.comment-text {
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: #1e293b;
+  margin-bottom: 4px;
+}
+
+.comment-anchor {
+  font-size: 0.75rem;
+  color: #64748b;
+  font-style: italic;
+}
+
+.comment-revised {
+  font-size: 0.75rem;
+  color: #22c55e;
+  margin-top: 4px;
+}
+
+.comment-error {
+  font-size: 0.75rem;
+  color: #ef4444;
+  margin-top: 4px;
+}
+
+/* Complete State */
+.complete-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+  font-weight: 600;
+  color: #22c55e;
+}
+
+.complete-icon {
+  width: 24px;
+  height: 24px;
+}
+
+/* Error State */
+.review-error .error-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  font-weight: 600;
+  color: #ef4444;
+}
+
+.error-icon {
+  width: 24px;
+  height: 24px;
+}
+
+.error-message {
+  font-size: 0.875rem;
+  color: #64748b;
+  margin: 0 0 16px 0;
+}
+
+.reset-btn {
+  width: 100%;
+  padding: 10px;
+  background: #f1f5f9;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  font-size: 0.875rem;
+  color: #64748b;
+  cursor: pointer;
+  transition: all 0.15s;
+  margin-top: 16px;
+}
+
+.reset-btn:hover {
+  background: #e2e8f0;
+  color: #1e293b;
+}
+
+/* Action Button */
+.review-action {
+  padding: 16px 20px;
+  border-top: 1px solid #e5e7eb;
+  flex-shrink: 0;
+}
+
+.review-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px 20px;
   background: #3b82f6;
   border: none;
   border-radius: 8px;
+  font-size: 0.95rem;
+  font-weight: 500;
   color: white;
   cursor: pointer;
   transition: all 0.15s;
 }
 
-.send-btn svg {
-  width: 18px;
-  height: 18px;
+.review-btn svg {
+  width: 20px;
+  height: 20px;
 }
 
-.send-btn:hover:not(:disabled) {
+.review-btn:hover:not(:disabled) {
   background: #2563eb;
 }
 
-.send-btn:disabled {
-  background: #cbd5e1;
+.review-btn:disabled {
+  background: #94a3b8;
   cursor: not-allowed;
 }
 
@@ -890,7 +883,7 @@ body {
     flex-direction: column;
   }
 
-  .agent-sidebar {
+  .review-sidebar {
     width: 100%;
     max-height: 50vh;
     border-left: none;
