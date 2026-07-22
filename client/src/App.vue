@@ -13,13 +13,17 @@ const backendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3050';
 const wsUrl = backendUrl.replace(/^http/, 'ws');
 const COLLAB_URL = `${wsUrl}/collaboration`;
 
-// A single stable collaboration room keeps the starter demo predictable.
-// Deployments can override it without changing the client bundle.
+// The initial room can be overridden; imports create a fresh room so Yjs
+// history from an earlier document cannot accumulate in the replacement.
 const roomId = ref(import.meta.env.VITE_DOCUMENT_ID || 'comment-review-demo');
 const roomCopied = ref(false);
 
 const superdoc = shallowRef(null);
 const queuedCommentCount = ref(0);
+const documentReady = ref(false);
+const documentLoadError = ref('');
+let collaborationReady = false;
+let readinessRun = 0;
 
 // Review state
 const reviewStatus = ref('idle'); // 'idle' | 'reviewing' | 'complete' | 'error'
@@ -29,14 +33,55 @@ const reviewController = new CommentReviewController(backendUrl);
 
 const commentQueueController = new CommentReviewQueueController({
   getComments: () => superdoc.value?.commentsStore?.commentsList || [],
-  isReviewing: () => reviewStatus.value === 'reviewing',
+  isReviewing: () => !documentReady.value || reviewStatus.value === 'reviewing',
   onQueueCountChange: (count) => { queuedCommentCount.value = count; },
   onReviewRequested: () => requestReview(),
 });
 
 const USER_COLORS = ['#a11134', '#2a7e34', '#b29d11', '#2f4597', '#ab5b22'];
 
-const initSuperDoc = () => {
+const getCommentSignature = () => (superdoc.value?.commentsStore?.commentsList || [])
+  .map((comment) => {
+    const values = typeof comment.getValues === 'function' ? comment.getValues() : comment;
+    return values.commentId || values.id || '';
+  })
+  .sort()
+  .join('|');
+
+const waitForDocumentAndComments = async () => {
+  const run = ++readinessRun;
+  const timeoutAt = Date.now() + 60_000;
+  let previousSignature = null;
+  let stableSince = 0;
+
+  documentReady.value = false;
+  documentLoadError.value = '';
+
+  while (run === readinessRun && Date.now() < timeoutAt) {
+    const commentsSynced = superdoc.value?.commentsStore?.hasSyncedCollaborationComments === true;
+    if (collaborationReady && superdoc.value?.activeEditor && commentsSynced) {
+      const signature = getCommentSignature();
+      if (signature !== previousSignature) {
+        previousSignature = signature;
+        stableSince = Date.now();
+      } else if (Date.now() - stableSince >= 750) {
+        commentQueueController.arm();
+        documentReady.value = true;
+        console.log('[Client] Document and comments fully loaded');
+        return;
+      }
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+
+  if (run === readinessRun) {
+    documentLoadError.value = 'Document and comments did not finish loading. Restart the demo and try again.';
+  }
+};
+
+const createRoomId = () => `comment-review-${crypto.randomUUID().slice(0, 8)}`;
+
+const initSuperDoc = (documentSource = sampleDocument) => {
   console.log('[Client] Initializing SuperDoc for room:', roomId.value);
 
   superdoc.value = new SuperDoc({
@@ -46,7 +91,10 @@ const initSuperDoc = () => {
     document: {
       id: roomId.value,
       type: 'docx',
-      url: sampleDocument,
+      isNewFile: true,
+      ...(typeof documentSource === 'string'
+        ? { url: documentSource }
+        : { data: documentSource, name: documentSource.name || 'document.docx' }),
     },
     layoutEngineOptions: {
       flowMode: 'semantic',
@@ -54,6 +102,10 @@ const initSuperDoc = () => {
     colors: USER_COLORS,
     user: generateUserInfo(),
     onCommentsUpdate: (payload) => commentQueueController.handleCommentsUpdate(payload),
+    onCollaborationReady: () => {
+      collaborationReady = true;
+      waitForDocumentAndComments();
+    },
     modules: {
       collaboration: {
         url: `${COLLAB_URL}`,
@@ -64,11 +116,10 @@ const initSuperDoc = () => {
       },
     },
   });
-  superdoc.value.once('ready', () => commentQueueController.arm());
 };
 
 const requestReview = async () => {
-  if (reviewStatus.value === 'reviewing') return;
+  if (!documentReady.value || reviewStatus.value === 'reviewing') return;
 
   reviewStatus.value = 'reviewing';
   reviewResult.value = null;
@@ -118,14 +169,18 @@ const replaceDocument = async (file) => {
 
   try {
     commentQueueController.pause();
-    await superdoc.value.activeEditor.replaceFile(file);
-    // Imported comments may arrive over several collaboration transactions.
-    // Seed them after the import settles rather than treating them as new work.
-    commentQueueController.armAfterDelay(500);
+    documentReady.value = false;
+    documentLoadError.value = '';
+    readinessRun++;
+    collaborationReady = false;
+    superdoc.value.destroy();
+    superdoc.value = null;
+    roomId.value = createRoomId();
     resetReview();
-    console.log('[Client] Document imported:', file.name);
+    initSuperDoc(file);
+    console.log(`[Client] Document imported into fresh room ${roomId.value}:`, file.name);
   } catch (e) {
-    commentQueueController.arm();
+    documentLoadError.value = e.message || 'Document import failed.';
     console.error('[Client] Import failed:', e);
   }
 };
@@ -191,6 +246,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  readinessRun++;
   commentQueueController.destroy();
   reviewController.destroy();
   superdoc.value?.destroy();
@@ -200,6 +256,12 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="app-wrapper">
+    <div v-if="!documentReady" class="loading-overlay">
+      <div class="loading-card">
+        <div v-if="!documentLoadError" class="spinner"></div>
+        <strong>{{ documentLoadError || 'Loading document and comments…' }}</strong>
+      </div>
+    </div>
     <!-- Top Header Bar -->
     <header class="top-header">
       <div class="logo">
@@ -383,7 +445,7 @@ onBeforeUnmount(() => {
           <button
             class="review-btn"
             @click="requestReview()"
-            :disabled="reviewStatus === 'reviewing'"
+            :disabled="!documentReady || reviewStatus === 'reviewing'"
           >
             <svg v-if="reviewStatus !== 'reviewing'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
@@ -414,6 +476,31 @@ body {
   flex-direction: column;
   background: #fff;
   overflow: hidden;
+  position: relative;
+}
+
+.loading-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(248, 250, 252, 0.88);
+  backdrop-filter: blur(2px);
+}
+
+.loading-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  max-width: 480px;
+  padding: 20px 24px;
+  border: 1px solid #dbeafe;
+  border-radius: 12px;
+  background: #fff;
+  color: #1e293b;
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.12);
 }
 
 /* Top Header */
