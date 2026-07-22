@@ -2,10 +2,11 @@
 import 'superdoc/style.css';
 import { onMounted, onBeforeUnmount, shallowRef, ref } from 'vue';
 import { SuperDoc } from 'superdoc';
-
-const superdocVersion = __SUPERDOC_VERSION__;
+import { CommentReviewQueueController } from './comment-review-queue.js';
+import { CommentReviewController } from './comment-review-controller.js';
 
 import sampleDocument from '/sample-document.docx?url';
+import blankDocument from '/blank.docx?url';
 
 // Backend URL: use VITE_BACKEND_URL env var, or fall back to localhost for dev
 const backendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3050';
@@ -18,47 +19,20 @@ const roomId = ref(import.meta.env.VITE_DOCUMENT_ID || 'comment-review-demo');
 const roomCopied = ref(false);
 
 const superdoc = shallowRef(null);
-const queuedCommentIds = new Set();
 const queuedCommentCount = ref(0);
-const knownCommentIds = new Set();
-let realtimeReviewArmed = false;
-let autoReviewTimer = null;
-
-const armRealtimeReview = () => {
-  knownCommentIds.clear();
-  for (const comment of superdoc.value?.commentsStore?.commentsList || []) {
-    const values = typeof comment.getValues === 'function' ? comment.getValues() : comment;
-    const id = values.commentId || values.id;
-    if (id) knownCommentIds.add(id);
-  }
-  realtimeReviewArmed = true;
-  console.log(`[Review] Real-time review armed with ${knownCommentIds.size} existing comments ignored`);
-};
-
-const queueCommentReview = (payload) => {
-  const comment = payload?.comment;
-  const commentId = comment?.commentId || comment?.id;
-  const wasKnown = commentId && knownCommentIds.has(commentId);
-  if (commentId) knownCommentIds.add(commentId);
-  if (
-    !realtimeReviewArmed ||
-    wasKnown ||
-    payload?.type !== 'add' ||
-    !commentId ||
-    comment.parentCommentId ||
-    comment.creatorName === 'Agent'
-  ) return;
-
-  queuedCommentIds.add(commentId);
-  queuedCommentCount.value = queuedCommentIds.size;
-  clearTimeout(autoReviewTimer);
-  autoReviewTimer = setTimeout(() => flushQueuedReviews(), 500);
-};
 
 // Review state
 const reviewStatus = ref('idle'); // 'idle' | 'reviewing' | 'complete' | 'error'
 const reviewResult = ref(null);
 const backendVersions = ref({ sdk: null, collab: null });
+const reviewController = new CommentReviewController(backendUrl);
+
+const commentQueueController = new CommentReviewQueueController({
+  getComments: () => superdoc.value?.commentsStore?.commentsList || [],
+  isReviewing: () => reviewStatus.value === 'reviewing',
+  onQueueCountChange: (count) => { queuedCommentCount.value = count; },
+  onReviewRequested: () => requestReview(),
+});
 
 const USER_COLORS = ['#a11134', '#2a7e34', '#b29d11', '#2f4597', '#ab5b22'];
 
@@ -79,7 +53,7 @@ const initSuperDoc = () => {
     },
     colors: USER_COLORS,
     user: generateUserInfo(),
-    onCommentsUpdate: queueCommentReview,
+    onCommentsUpdate: (payload) => commentQueueController.handleCommentsUpdate(payload),
     modules: {
       collaboration: {
         url: `${COLLAB_URL}`,
@@ -90,52 +64,10 @@ const initSuperDoc = () => {
       },
     },
   });
-  superdoc.value.once('ready', armRealtimeReview);
+  superdoc.value.once('ready', () => commentQueueController.arm());
 };
 
-// Poll for review completion
-const pollForReviewResult = async (jobId) => {
-  const pollInterval = 1000;
-  const maxAttempts = 120;
-
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      const response = await fetch(`${backendUrl}/review/jobs/${jobId}`);
-      const job = await response.json();
-
-      console.log(`[Review] Poll #${i + 1}: ${job.status}`);
-
-      // Update progress
-      if (job.result) {
-        reviewResult.value = job.result;
-      }
-
-      if (job.status === 'complete') {
-        return job.result;
-      } else if (job.status === 'error') {
-        throw new Error(job.result?.error || 'Review failed');
-      }
-
-      await new Promise(resolve => setTimeout(resolve, pollInterval));
-    } catch (e) {
-      console.error('[Review] Poll failed:', e);
-      throw e;
-    }
-  }
-
-  throw new Error('Review timed out');
-};
-
-const flushQueuedReviews = async () => {
-  if (reviewStatus.value === 'reviewing' || queuedCommentIds.size === 0) return;
-  const commentIds = [...queuedCommentIds];
-  queuedCommentIds.clear();
-  queuedCommentCount.value = 0;
-  await requestReview(commentIds);
-};
-
-const requestReview = async (requestedCommentIds = []) => {
-  if (!Array.isArray(requestedCommentIds)) requestedCommentIds = [];
+const requestReview = async () => {
   if (reviewStatus.value === 'reviewing') return;
 
   reviewStatus.value = 'reviewing';
@@ -144,36 +76,10 @@ const requestReview = async (requestedCommentIds = []) => {
   try {
     console.log('[Review] Starting review for room:', roomId.value);
 
-    // The headless SDK currently returns comment anchors but can omit the
-    // browser collaboration model's commentText field. Send the synchronized
-    // bodies as a fallback so the reviewer can still process each instruction.
-    const commentInstructions = Object.fromEntries(
-      (superdoc.value?.commentsStore?.commentsList || [])
-        .map((comment) => {
-          const values = typeof comment.getValues === 'function' ? comment.getValues() : comment;
-          const id = values.commentId || values.id;
-          const text = values.commentText || values.text || '';
-          return [id, text];
-        })
-        .filter(([id, text]) => id && text)
-    );
-
-    const response = await fetch(`${backendUrl}/review`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        documentId: roomId.value,
-        commentInstructions,
-        commentIds: requestedCommentIds,
-      }),
+    const result = await reviewController.review({
+      documentId: roomId.value,
+      onProgress: (progress) => { reviewResult.value = progress; },
     });
-
-    const { jobId, error } = await response.json();
-    if (error) throw new Error(error);
-
-    console.log(`[Review] Job created: ${jobId}`);
-
-    const result = await pollForReviewResult(jobId);
     reviewResult.value = result;
     reviewStatus.value = 'complete';
     console.log('[Review] Complete:', result);
@@ -182,9 +88,7 @@ const requestReview = async (requestedCommentIds = []) => {
     reviewStatus.value = 'error';
     reviewResult.value = { error: e.message };
   } finally {
-    if (queuedCommentIds.size) {
-      autoReviewTimer = setTimeout(() => flushQueuedReviews(), 500);
-    }
+    commentQueueController.reviewSettled();
   }
 };
 
@@ -198,13 +102,8 @@ const generateUserInfo = () => {
   return {
     name: `User-${randomUser}`,
     email: `${randomUser}@superdoc.dev`,
-    color: getRandomUserColor(),
+    color: USER_COLORS[Math.floor(Math.random() * USER_COLORS.length)],
   };
-};
-
-const getRandomUserColor = () => {
-  const index = Math.floor(Math.random() * USER_COLORS.length);
-  return USER_COLORS[index];
 };
 
 // File input ref for import
@@ -214,23 +113,41 @@ const handleImport = () => {
   fileInput.value?.click();
 };
 
-const onFileSelected = async (event) => {
-  const file = event.target.files?.[0];
+const replaceDocument = async (file) => {
   if (!file || !superdoc.value) return;
 
   try {
-    realtimeReviewArmed = false;
+    commentQueueController.pause();
     await superdoc.value.activeEditor.replaceFile(file);
     // Imported comments may arrive over several collaboration transactions.
     // Seed them after the import settles rather than treating them as new work.
-    setTimeout(armRealtimeReview, 500);
+    commentQueueController.armAfterDelay(500);
+    resetReview();
     console.log('[Client] Document imported:', file.name);
   } catch (e) {
-    armRealtimeReview();
+    commentQueueController.arm();
     console.error('[Client] Import failed:', e);
   }
+};
+
+const onFileSelected = async (event) => {
+  const file = event.target.files?.[0];
+  await replaceDocument(file);
 
   event.target.value = '';
+};
+
+const handleBlankDocument = async () => {
+  try {
+    const response = await fetch(blankDocument);
+    if (!response.ok) throw new Error(`Blank document request failed (${response.status})`);
+    const file = new File([await response.blob()], 'blank.docx', {
+      type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    });
+    await replaceDocument(file);
+  } catch (e) {
+    console.error('[Client] Blank document import failed:', e);
+  }
 };
 
 const handleExport = async () => {
@@ -260,14 +177,9 @@ const copyRoomId = async () => {
 
 const checkBackendHealth = async () => {
   try {
-    const response = await fetch(`${backendUrl}/health`);
-    const data = await response.json();
-    if (data.status === 'ok') {
-      if (data.versions) {
-        backendVersions.value = data.versions;
-      }
-      console.log('[Client] Backend healthy:', data);
-    }
+    const data = await reviewController.health();
+    backendVersions.value = data.versions || backendVersions.value;
+    console.log('[Client] Backend healthy:', data);
   } catch (e) {
     console.error('[Client] Backend unreachable:', e);
   }
@@ -279,7 +191,8 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
-  clearTimeout(autoReviewTimer);
+  commentQueueController.destroy();
+  reviewController.destroy();
   superdoc.value?.destroy();
   superdoc.value = null;
 });
@@ -309,6 +222,9 @@ onBeforeUnmount(() => {
           <svg viewBox="0 0 640 640" fill="currentColor">
             <path d="M352 173.3L352 384C352 401.7 337.7 416 320 416C302.3 416 288 401.7 288 384L288 173.3L246.6 214.7C234.1 227.2 213.8 227.2 201.3 214.7C188.8 202.2 188.8 181.9 201.3 169.4L297.3 73.4C309.8 60.9 330.1 60.9 342.6 73.4L438.6 169.4C451.1 181.9 451.1 202.2 438.6 214.7C426.1 227.2 405.8 227.2 393.3 214.7L352 173.3zM320 464C364.2 464 400 428.2 400 384L480 384C515.3 384 544 412.7 544 448L544 480C544 515.3 515.3 544 480 544L160 544C124.7 544 96 515.3 96 480L96 448C96 412.7 124.7 384 160 384L240 384C240 428.2 275.8 464 320 464zM464 488C477.3 488 488 477.3 488 464C488 450.7 477.3 440 464 440C450.7 440 440 450.7 440 464C440 477.3 450.7 488 464 488z"/>
           </svg>
+        </button>
+        <button class="header-btn with-text" @click="handleBlankDocument" title="Import a blank document">
+          <span>Blank document</span>
         </button>
         <button class="header-btn" @click="handleExport" title="Export">
           <svg viewBox="0 0 640 640" fill="currentColor">
@@ -466,7 +382,7 @@ onBeforeUnmount(() => {
         <div class="review-action">
           <button
             class="review-btn"
-            @click="requestReview"
+            @click="requestReview()"
             :disabled="reviewStatus === 'reviewing'"
           >
             <svg v-if="reviewStatus !== 'reviewing'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

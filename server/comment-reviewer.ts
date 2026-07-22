@@ -43,19 +43,10 @@ export class CommentReviewer {
   private openai: OpenAI;
   private documentId: string;
   private collaborationUrl: string;
-  private commentInstructions: Record<string, string>;
-  private requestedCommentIds: Set<string> | null;
 
-  constructor(
-    documentId: string,
-    collaborationUrl: string,
-    commentInstructions: Record<string, string> = {},
-    requestedCommentIds: string[] = [],
-  ) {
+  constructor(documentId: string, collaborationUrl: string) {
     this.documentId = documentId;
     this.collaborationUrl = collaborationUrl;
-    this.commentInstructions = commentInstructions;
-    this.requestedCommentIds = requestedCommentIds.length ? new Set(requestedCommentIds) : null;
     this.openai = new OpenAI();
   }
 
@@ -94,23 +85,32 @@ export class CommentReviewer {
     };
 
     try {
-      // List all comments
+      // ======================================================================
+      // COMMENT DISCOVERY AND FILTERING
+      // Read the live document, keep actionable open root comments, and skip
+      // synthetic redline entries or threads the Agent already answered.
+      // ======================================================================
       console.log('[CommentReviewer] Listing comments...');
       const commentsResult = await this.doc.comments.list({ includeResolved: false });
       const allComments = commentsResult?.items ?? [];
 
-      // Debug: log raw comment data
-      console.log(`[CommentReviewer] Raw comments:`, JSON.stringify(allComments, null, 2));
-
       // Filter to root-level, open comments only
+      const processedCommentIds = new Set(
+        allComments
+          .filter((c: any) =>
+            c.parentCommentId &&
+            (c.creatorName === 'Agent' || c.creatorEmail === 'agent@superdoc.dev')
+          )
+          .map((c: any) => c.parentCommentId)
+      );
       const rootComments = allComments.filter(
         (c: any) =>
           !c.parentCommentId &&
-          (!this.requestedCommentIds || this.requestedCommentIds.has(c.id)) &&
+          !processedCommentIds.has(c.id) &&
           c.status === 'open' &&
           c.target &&
           c.anchoredText &&
-          Boolean(c.text || this.commentInstructions[c.id])
+          Boolean(c.text)
       );
 
       result.commentsFound = rootComments.length;
@@ -132,7 +132,11 @@ export class CommentReviewer {
       }
       onProgress?.(result);
 
-      // Process each comment
+      // ======================================================================
+      // SEQUENTIAL COMMENT PROCESSING
+      // Process each selected comment independently and publish progress after
+      // every state change so one failure does not stop the remaining work.
+      // ======================================================================
       for (let i = 0; i < rootComments.length; i++) {
         const comment = rootComments[i];
         const progress = result.comments[i];
@@ -168,22 +172,16 @@ export class CommentReviewer {
     let fullComment = await this.doc!.comments.get({ id: comment.id });
     console.log(`[CommentReviewer] Full comment:`, JSON.stringify(fullComment, null, 2));
 
-    // A real comment may inherit tracked-change metadata when its selection
-    // overlaps an existing redline. Read that redline before accepting it so
-    // the agent can incorporate the drafter's proposed insertion/deletion.
-    const overlappingChangeId = fullComment.trackedChangeLink?.trackedChangeId;
-    let overlappingChange: any = null;
-    if (overlappingChangeId) {
-      overlappingChange = await this.doc!.trackChanges.get({ id: overlappingChangeId });
-      console.log(`[CommentReviewer] Overlapping tracked change:`, JSON.stringify(overlappingChange, null, 2));
-    }
-
+    // ========================================================================
+    // OVERLAPPING REDLINE CONTEXT
+    // A real comment can inherit metadata from a redline inside its range.
+    // Load that revision so the Agent considers the drafter's existing intent.
+    // ========================================================================
     // Get the anchored text and instruction
     const anchoredText = fullComment.anchoredText || comment.anchoredText || '';
     const rawCommentInstruction =
       fullComment.text ||
       comment.text ||
-      this.commentInstructions[comment.id] ||
       '';
     const commentInstruction = rawCommentInstruction
       .replace(/<[^>]*>/g, ' ')
@@ -206,42 +204,75 @@ export class CommentReviewer {
     console.log(`[CommentReviewer] Anchored: "${anchoredText.substring(0, 50)}..."`);
     console.log(`[CommentReviewer] Instruction: "${commentInstruction.substring(0, 50)}..."`);
 
-    // Use LLM to determine the revision
-    const { revisedText, explanation } = await this.generateRevision(
-      anchoredText,
-      commentInstruction,
-      overlappingChange,
-    );
-    progress.revisedText = revisedText;
-    progress.explanation = explanation;
+    // ========================================================================
+    // EXISTING REDLINE RESOLUTION
+    // The SDK exposes one overlapping redline at a time. Capture its context,
+    // accept it, and refetch until the comment anchor no longer links a redline.
+    // ========================================================================
+    const overlappingChanges: any[] = [];
+    const acceptedChangeIds = new Set<string>();
+    while (fullComment.trackedChangeLink?.trackedChangeId) {
+      const changeId = fullComment.trackedChangeLink.trackedChangeId;
+      const change = await this.doc!.trackChanges.get({ id: changeId });
 
-    console.log(`[CommentReviewer] Revised: "${revisedText.substring(0, 50)}..."`);
+      // Structural revisions describe an enclosing table or other container,
+      // not a local text change. Accepting them could mutate far beyond the
+      // comment range, and the SDK may keep reporting the same container link.
+      if (change.type === 'structural' || changeId.startsWith('word:structural:')) {
+        console.log(`[CommentReviewer] Leaving enclosing structural change unchanged: ${changeId}`);
+        break;
+      }
 
-    // The consolidated revision is ready. Accept the drafter's old redline,
-    // then refetch the comment so reply/edit operations use its remapped anchor.
-    if (overlappingChangeId) {
-      console.log(`[CommentReviewer] Accepting reviewed tracked change: ${overlappingChangeId}`);
+      if (acceptedChangeIds.has(changeId)) {
+        throw new Error(`Tracked change ${changeId} remained linked after acceptance.`);
+      }
+
+      overlappingChanges.push(change);
+      acceptedChangeIds.add(changeId);
+      console.log(`[CommentReviewer] Captured overlapping tracked change:`, JSON.stringify(change, null, 2));
+      console.log(`[CommentReviewer] Accepting reviewed tracked change: ${changeId}`);
       await this.doc!.trackChanges.decide({
         decision: 'accept',
         target: {
           kind: 'id',
-          id: overlappingChangeId,
+          id: changeId,
         },
       });
       fullComment = await this.doc!.comments.get({ id: comment.id });
       console.log(`[CommentReviewer] Refetched comment after accepting overlap:`, JSON.stringify(fullComment, null, 2));
     }
 
-    // Reply while the original comment anchor is still valid. A tracked
-    // replacement can invalidate that target before a reply is attached.
+    // ========================================================================
+    // AGENT REVISION GENERATION
+    // Send the original selected text, user instruction, and every captured
+    // redline to the model for one consolidated revision and rationale.
+    // ========================================================================
+    const { revisedText, explanation } = await this.generateRevision(
+      anchoredText,
+      commentInstruction,
+      overlappingChanges,
+    );
+    progress.revisedText = revisedText;
+    progress.explanation = explanation;
+
+    console.log(`[CommentReviewer] Revised: "${revisedText.substring(0, 50)}..."`);
+
+    // ========================================================================
+    // EXISTING THREAD REPLY
+    // Reply after old overlapping redlines are accepted, but before the Agent's
+    // new tracked replacement can invalidate the remapped comment target.
+    // ========================================================================
     await this.doc!.comments.create({
       text: `I'm applying a tracked revision.\n\n${explanation}\n\nPlease review and accept or reject the change.`,
       parentId: comment.id,
     });
     console.log(`[CommentReviewer] Added rationale reply to comment ${comment.id}`);
 
-    // Apply the change as a tracked replacement. Comment targets use a segment-based text
-    // shape, while replace() expects a selection with text positions.
+    // ========================================================================
+    // TRACKED REVISION APPLICATION
+    // Convert the comment's segment anchor into a selection, then author one
+    // whole-range tracked insertion and deletion without word-level diffing.
+    // ========================================================================
     const target = fullComment.target || comment.target;
     const segments = target?.kind === 'text' ? target.segments : null;
     if (segments?.length) {
@@ -286,8 +317,13 @@ export class CommentReviewer {
   private async generateRevision(
     anchoredText: string,
     instruction: string,
-    overlappingChange?: any,
+    overlappingChanges: any[] = [],
   ): Promise<{ revisedText: string; explanation: string }> {
+    // ========================================================================
+    // MODEL PROMPT CONSTRUCTION
+    // Define the response contract and add the overlapping redline's inserted
+    // and deleted text when the comment was placed across an existing revision.
+    // ========================================================================
     const systemPrompt = `You are a document editor assistant. The user has left a comment on a piece of text, instructing you to make a change.
 
 Your task:
@@ -304,13 +340,14 @@ Respond with ONLY a JSON object in this exact format:
 The explanation must provide useful reasoning rather than merely repeat or quote the revised text.
 Do not include any other text, markdown formatting, or code blocks. Just the JSON object.`;
 
-    const redlineContext = overlappingChange
-      ? `\nExisting tracked revision within the commented range:
-- Change type: ${overlappingChange.type || 'unknown'}
-- Deleted text: ${overlappingChange.deletedText || '(none)'}
-- Inserted text: ${overlappingChange.insertedText || '(none)'}
+    const redlineContext = overlappingChanges.length
+      ? `\nExisting tracked revisions within the commented range:
+${overlappingChanges.map((change, index) => `Revision ${index + 1}:
+- Change type: ${change.type || 'unknown'}
+- Deleted text: ${change.deletedText || '(none)'}
+- Inserted text: ${change.insertedText || '(none)'}`).join('\n')}
 
-Treat the existing tracked revision as the drafter's proposed intent. Incorporate it when producing one consolidated revision that also satisfies the comment.`
+Treat the existing tracked revisions as the drafter's proposed intent. Incorporate them when producing one consolidated revision that also satisfies the comment.`
       : '';
 
     const userPrompt = `Original text: "${anchoredText}"
@@ -320,6 +357,11 @@ ${redlineContext}
 
 Provide the revised text that addresses this comment.`;
 
+    // ========================================================================
+    // OPENAI COMPLETION
+    // Request one structured revision from the model; the JSON response is
+    // validated below before any document mutation uses it.
+    // ========================================================================
     const completion = await this.openai.chat.completions.create({
       model: 'gpt-4.1',
       messages: [

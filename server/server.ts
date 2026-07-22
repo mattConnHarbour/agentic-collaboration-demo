@@ -16,52 +16,15 @@ import {
   type ServiceConfig
 } from '@superdoc-dev/superdoc-yjs-collaboration';
 
-import { Agent } from './agent.js';
-import { Job } from './job.js';
-import { CommentReviewer, type ReviewResult } from './comment-reviewer.js';
+import { CommentReviewer } from './comment-reviewer.js';
+import { ReviewJobStore } from './review-job-store.js';
 
 // Get package versions
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const sdkVersion = JSON.parse(readFileSync(join(__dirname, 'node_modules/@superdoc-dev/sdk/package.json'), 'utf-8')).version;
 const collabVersion = JSON.parse(readFileSync(join(__dirname, 'node_modules/@superdoc-dev/superdoc-yjs-collaboration/package.json'), 'utf-8')).version;
 
-// ============================================================================
-// Agent Registry
-// ============================================================================
-
-const agents = new Map<string, Agent>();
-
-async function getOrCreateAgent(sessionId: string, documentId: string, collaborationUrl: string): Promise<Agent> {
-  let agent = agents.get(sessionId);
-  if (!agent) {
-    agent = new Agent(documentId, collaborationUrl);
-    await agent.connect();
-    agents.set(sessionId, agent);
-    console.log(`[Server] Created agent for session: ${sessionId}`);
-  }
-  return agent;
-}
-
-// ============================================================================
-// Review Registry
-// ============================================================================
-
-interface ReviewJob {
-  id: string;
-  status: 'pending' | 'processing' | 'complete' | 'error';
-  result: ReviewResult | null;
-  createdAt: number;
-}
-
-const reviews = new Map<string, ReviewJob>();
-const REVIEW_TTL = 5 * 60 * 1000; // 5 minutes
-
-function cleanupReview(jobId: string): void {
-  setTimeout(() => {
-    reviews.delete(jobId);
-    console.log(`[Server] Cleaned up review: ${jobId}`);
-  }, REVIEW_TTL);
-}
+const reviewJobs = new ReviewJobStore();
 
 // ============================================================================
 // Collaboration Hooks
@@ -116,16 +79,6 @@ async function main() {
     },
   }));
 
-  // Agent health check
-  fastify.get('/health/agent', async (request) => {
-    const sessionId = (request.query as { session?: string }).session;
-    if (sessionId) {
-      const agent = agents.get(sessionId);
-      return { status: agent ? 'connected' : 'not_found', session: sessionId };
-    }
-    return { status: 'ok', activeSessions: agents.size, activeJobs: Job.count };
-  });
-
   // Collaboration WebSocket
   fastify.get('/collaboration/:documentId', { websocket: true }, (socket, request) => {
     const documentId = (request.params as { documentId: string }).documentId;
@@ -134,105 +87,50 @@ async function main() {
   });
 
   // ============================================================================
-  // Chat API (HTTP + Polling)
-  // ============================================================================
-
-  // Create a chat job
-  fastify.post('/chat', async (request) => {
-    const { sessionId, documentId, prompt } = request.body as {
-      sessionId: string;
-      documentId: string;
-      prompt: string;
-    };
-
-    if (!sessionId || !documentId || !prompt) {
-      return { error: 'Missing required fields: sessionId, documentId, prompt' };
-    }
-
-    const job = Job.create();
-
-    // Fire and forget - process asynchronously
-    getOrCreateAgent(sessionId, documentId, collaborationUrl)
-      .then(agent => job.process(agent, prompt));
-
-    return { jobId: job.id };
-  });
-
-  // Poll for job result
-  fastify.get('/chat/jobs/:jobId', async (request) => {
-    const { jobId } = request.params as { jobId: string };
-    const job = Job.get(jobId);
-
-    if (!job) {
-      return { error: 'Job not found' };
-    }
-
-    return job.toJSON();
-  });
-
-  // ============================================================================
   // Review API (Comment Review)
   // ============================================================================
 
   // Trigger a comment review
   fastify.post('/review', async (request) => {
-    const { documentId, commentInstructions = {}, commentIds = [] } = request.body as {
+    const { documentId } = request.body as {
       documentId: string;
-      commentInstructions?: Record<string, string>;
-      commentIds?: string[];
     };
 
     if (!documentId) {
       return { error: 'Missing required field: documentId' };
     }
 
-    const jobId = crypto.randomUUID();
-    const job: ReviewJob = {
-      id: jobId,
-      status: 'pending',
-      result: null,
-      createdAt: Date.now(),
-    };
-    reviews.set(jobId, job);
+    const job = reviewJobs.create();
+    const jobId = job.id;
 
     console.log(`[Server] Review job created: ${jobId} for document: ${documentId}`);
 
     // Fire and forget - process asynchronously
     (async () => {
-      job.status = 'processing';
+      reviewJobs.markProcessing(jobId);
 
-      const reviewer = new CommentReviewer(
-        documentId,
-        collaborationUrl,
-        commentInstructions,
-        commentIds,
-      );
+      let reviewer: CommentReviewer | null = null;
       try {
+        reviewer = new CommentReviewer(documentId, collaborationUrl);
         await reviewer.connect();
         const result = await reviewer.review((progress) => {
-          job.result = progress;
+          reviewJobs.updateProgress(jobId, progress);
         });
-        job.result = result;
-        job.status = result.status === 'error' ? 'error' : 'complete';
+        reviewJobs.complete(jobId, result);
         console.log(`[Server] Review job complete: ${jobId}`);
       } catch (err: any) {
         console.error(`[Server] Review job failed: ${jobId}`, err);
-        job.status = 'error';
-        job.result = {
-          status: 'error',
-          commentsFound: 0,
-          commentsProcessed: 0,
-          comments: [],
-          error: err.message,
-        };
+        reviewJobs.fail(jobId, err.message);
       } finally {
-        try {
-          await reviewer.disconnect();
-        } catch (err) {
-          // Cleanup must never terminate the long-running API process.
-          console.error(`[Server] Reviewer cleanup failed: ${jobId}`, err);
+        if (reviewer) {
+          try {
+            await reviewer.disconnect();
+          } catch (err) {
+            // Cleanup must never terminate the long-running API process.
+            console.error(`[Server] Reviewer cleanup failed: ${jobId}`, err);
+          }
         }
-        cleanupReview(jobId);
+        reviewJobs.scheduleCleanup(jobId);
       }
     })();
 
@@ -242,7 +140,7 @@ async function main() {
   // Poll for review result
   fastify.get('/review/jobs/:jobId', async (request) => {
     const { jobId } = request.params as { jobId: string };
-    const job = reviews.get(jobId);
+    const job = reviewJobs.get(jobId);
 
     if (!job) {
       return { error: 'Review job not found' };
@@ -261,7 +159,7 @@ async function main() {
   console.log('[Server] ' + '='.repeat(50));
   console.log(`[Server] Listening at http://0.0.0.0:${port}`);
   console.log(`[Server] Collaboration: ws://localhost:${port}/collaboration/:documentId`);
-  console.log(`[Server] Chat API: POST /chat, GET /chat/jobs/:jobId`);
+  console.log(`[Server] Review API: POST /review, GET /review/jobs/:jobId`);
   console.log('[Server] ' + '='.repeat(50));
 }
 
