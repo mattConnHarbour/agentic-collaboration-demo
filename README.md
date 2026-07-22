@@ -7,17 +7,20 @@ The user comments on selected text. The agent reads the comment, replies in the 
 ## Architecture
 
 ```mermaid
+%%{init: {"flowchart": {"rankSpacing": 90}}}%%
 flowchart TD
     Client[Vue + SuperDoc client]
     Server[Fastify collaboration and review server]
     Agent[SuperDoc SDK review agent]
     OpenAI[OpenAI]
 
-    Client <-->|Document and comment sync via WebSocket| Server
+    Client -->|Comments and document edits via WebSocket| Server
     Client -->|Start review and poll progress via HTTP| Server
-    Server --> Agent
-    Agent -->|Generate revision and explanation| OpenAI
+    Server -->|Live comments and document state| Agent
+    Agent -->|Revision request| OpenAI
+    OpenAI -->|Revision and explanation| Agent
     Agent -->|Reply and tracked revision| Server
+    Server -->|Broadcast agent changes via WebSocket| Client
 ```
 
 ## Requirements
