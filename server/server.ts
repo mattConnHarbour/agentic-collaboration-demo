@@ -176,9 +176,10 @@ async function main() {
 
   // Trigger a comment review
   fastify.post('/review', async (request) => {
-    const { documentId, commentInstructions = {} } = request.body as {
+    const { documentId, commentInstructions = {}, commentIds = [] } = request.body as {
       documentId: string;
       commentInstructions?: Record<string, string>;
+      commentIds?: string[];
     };
 
     if (!documentId) {
@@ -200,7 +201,12 @@ async function main() {
     (async () => {
       job.status = 'processing';
 
-      const reviewer = new CommentReviewer(documentId, collaborationUrl, commentInstructions);
+      const reviewer = new CommentReviewer(
+        documentId,
+        collaborationUrl,
+        commentInstructions,
+        commentIds,
+      );
       try {
         await reviewer.connect();
         const result = await reviewer.review((progress) => {

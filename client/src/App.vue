@@ -12,37 +12,48 @@ const backendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3050';
 const wsUrl = backendUrl.replace(/^http/, 'ws');
 const COLLAB_URL = `${wsUrl}/collaboration`;
 
-// Room ID generation
-const ADJECTIVES = ['swift', 'brave', 'clever', 'mighty', 'gentle', 'fierce', 'calm', 'bold', 'wise', 'quick'];
-const ANIMALS = ['fox', 'owl', 'bear', 'wolf', 'eagle', 'tiger', 'otter', 'raven', 'falcon', 'panda'];
-
-const generateRoomId = () => {
-  const adj = ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)];
-  const animal = ANIMALS[Math.floor(Math.random() * ANIMALS.length)];
-  const num = String(Math.floor(Math.random() * 1000)).padStart(3, '0');
-  return `${adj}-${animal}-${num}`;
-};
-
-const getOrCreateRoomId = () => {
-  const params = new URLSearchParams(window.location.search);
-  const roomParam = params.get('room');
-
-  if (roomParam) {
-    return roomParam;
-  }
-
-  const newRoomId = generateRoomId();
-  const url = new URL(window.location.href);
-  url.searchParams.set('room', newRoomId);
-  window.history.replaceState({}, '', url.toString());
-
-  return newRoomId;
-};
-
-const roomId = ref(getOrCreateRoomId());
+// A single stable collaboration room keeps the starter demo predictable.
+// Deployments can override it without changing the client bundle.
+const roomId = ref(import.meta.env.VITE_DOCUMENT_ID || 'comment-review-demo');
 const roomCopied = ref(false);
 
 const superdoc = shallowRef(null);
+const queuedCommentIds = new Set();
+const queuedCommentCount = ref(0);
+const knownCommentIds = new Set();
+let realtimeReviewArmed = false;
+let autoReviewTimer = null;
+
+const armRealtimeReview = () => {
+  knownCommentIds.clear();
+  for (const comment of superdoc.value?.commentsStore?.commentsList || []) {
+    const values = typeof comment.getValues === 'function' ? comment.getValues() : comment;
+    const id = values.commentId || values.id;
+    if (id) knownCommentIds.add(id);
+  }
+  realtimeReviewArmed = true;
+  console.log(`[Review] Real-time review armed with ${knownCommentIds.size} existing comments ignored`);
+};
+
+const queueCommentReview = (payload) => {
+  const comment = payload?.comment;
+  const commentId = comment?.commentId || comment?.id;
+  const wasKnown = commentId && knownCommentIds.has(commentId);
+  if (commentId) knownCommentIds.add(commentId);
+  if (
+    !realtimeReviewArmed ||
+    wasKnown ||
+    payload?.type !== 'add' ||
+    !commentId ||
+    comment.parentCommentId ||
+    comment.creatorName === 'Agent'
+  ) return;
+
+  queuedCommentIds.add(commentId);
+  queuedCommentCount.value = queuedCommentIds.size;
+  clearTimeout(autoReviewTimer);
+  autoReviewTimer = setTimeout(() => flushQueuedReviews(), 500);
+};
 
 // Review state
 const reviewStatus = ref('idle'); // 'idle' | 'reviewing' | 'complete' | 'error'
@@ -68,6 +79,7 @@ const initSuperDoc = () => {
     },
     colors: USER_COLORS,
     user: generateUserInfo(),
+    onCommentsUpdate: queueCommentReview,
     modules: {
       collaboration: {
         url: `${COLLAB_URL}`,
@@ -78,6 +90,7 @@ const initSuperDoc = () => {
       },
     },
   });
+  superdoc.value.once('ready', armRealtimeReview);
 };
 
 // Poll for review completion
@@ -113,7 +126,16 @@ const pollForReviewResult = async (jobId) => {
   throw new Error('Review timed out');
 };
 
-const requestReview = async () => {
+const flushQueuedReviews = async () => {
+  if (reviewStatus.value === 'reviewing' || queuedCommentIds.size === 0) return;
+  const commentIds = [...queuedCommentIds];
+  queuedCommentIds.clear();
+  queuedCommentCount.value = 0;
+  await requestReview(commentIds);
+};
+
+const requestReview = async (requestedCommentIds = []) => {
+  if (!Array.isArray(requestedCommentIds)) requestedCommentIds = [];
   if (reviewStatus.value === 'reviewing') return;
 
   reviewStatus.value = 'reviewing';
@@ -139,7 +161,11 @@ const requestReview = async () => {
     const response = await fetch(`${backendUrl}/review`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ documentId: roomId.value, commentInstructions }),
+      body: JSON.stringify({
+        documentId: roomId.value,
+        commentInstructions,
+        commentIds: requestedCommentIds,
+      }),
     });
 
     const { jobId, error } = await response.json();
@@ -155,6 +181,10 @@ const requestReview = async () => {
     console.error('[Review] Error:', e);
     reviewStatus.value = 'error';
     reviewResult.value = { error: e.message };
+  } finally {
+    if (queuedCommentIds.size) {
+      autoReviewTimer = setTimeout(() => flushQueuedReviews(), 500);
+    }
   }
 };
 
@@ -189,9 +219,14 @@ const onFileSelected = async (event) => {
   if (!file || !superdoc.value) return;
 
   try {
+    realtimeReviewArmed = false;
     await superdoc.value.activeEditor.replaceFile(file);
+    // Imported comments may arrive over several collaboration transactions.
+    // Seed them after the import settles rather than treating them as new work.
+    setTimeout(armRealtimeReview, 500);
     console.log('[Client] Document imported:', file.name);
   } catch (e) {
+    armRealtimeReview();
     console.error('[Client] Import failed:', e);
   }
 
@@ -244,6 +279,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  clearTimeout(autoReviewTimer);
   superdoc.value?.destroy();
   superdoc.value = null;
 });
@@ -302,12 +338,17 @@ onBeforeUnmount(() => {
             <a v-if="backendVersions.sdk" class="version-pill" :href="`https://www.npmjs.com/package/@superdoc-dev/sdk/v/${backendVersions.sdk}`" target="_blank">sdk {{ backendVersions.sdk }}</a>
           </div>
           <p class="review-description">
-            Add comments to the document, then click "Request Review" to have the AI agent process each comment and apply tracked changes.
+            New comments are reviewed automatically in real time. Click "Request Review" to process existing open comments on demand.
           </p>
         </div>
 
         <!-- Review Content -->
         <div class="review-content">
+          <div v-if="queuedCommentCount" class="queue-banner">
+            <span class="queue-dot"></span>
+            <span>{{ queuedCommentCount }} comment{{ queuedCommentCount === 1 ? '' : 's' }} queued</span>
+          </div>
+
           <!-- Idle State -->
           <div v-if="reviewStatus === 'idle'" class="review-idle">
             <div class="review-instructions">
@@ -315,8 +356,9 @@ onBeforeUnmount(() => {
               <ol>
                 <li>Select text in the document</li>
                 <li>Add a comment with your instruction (e.g., "make this more formal")</li>
-                <li>Click "Request Review" below</li>
-                <li>The agent will apply tracked changes for each comment</li>
+                <li>The agent automatically queues and reviews new comments in real time</li>
+                <li>Or click "Request Review" below to process existing open comments</li>
+                <li>The agent replies in the thread and applies a tracked revision</li>
               </ol>
             </div>
           </div>
@@ -353,6 +395,9 @@ onBeforeUnmount(() => {
                   <span v-else-if="comment.status === 'error'" class="status-error">&#10007;</span>
                 </div>
                 <div class="comment-info">
+                  <div v-if="comment.status === 'pending' || comment.status === 'processing'" class="comment-queue-status">
+                    {{ comment.status === 'pending' ? 'Queued' : comment.status === 'processing' ? 'Processing' : '' }}
+                  </div>
                   <div class="comment-text">{{ comment.commentText || '(no text)' }}</div>
                   <div class="comment-anchor">On: "{{ comment.anchoredText?.substring(0, 40) }}{{ comment.anchoredText?.length > 40 ? '...' : '' }}"</div>
                   <div v-if="comment.error" class="comment-error">{{ comment.error }}</div>
@@ -634,6 +679,27 @@ body {
   min-height: 0;
 }
 
+.queue-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  margin-bottom: 16px;
+  color: #2563eb;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  border-radius: 8px;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.queue-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #3b82f6;
+}
+
 .review-idle .review-instructions {
   background: #f8fafc;
   border-radius: 8px;
@@ -726,6 +792,16 @@ body {
 
 .comment-item.processing {
   border-left-color: #3b82f6;
+}
+
+.comment-queue-status {
+  min-height: 1rem;
+  margin-bottom: 2px;
+  color: #3b82f6;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .comment-status-icon {
