@@ -1,192 +1,75 @@
-# SuperDoc Document Editing Agent
+# SuperDoc Comment Review Agent
 
-A chat-based AI agent that can read and modify documents using the SuperDoc SDK. This example demonstrates:
+A local demo of a user and AI agent reviewing a document together.
 
-- Real-time chat interface with an AI document editing agent
-- Agent uses `chooseTools()` to get LLM-compatible tool definitions
-- Full agentic loop with tool calling via OpenAI
-- Document edits broadcast to all clients via Yjs collaboration
+The user comments on selected text. The agent reads the comment, replies in the same thread, and applies its revision as a tracked change.
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         Vue Client (port 5173)                      │
-│  ┌──────────────────────────┐    ┌────────────────────────────────┐ │
-│  │     SuperDoc Editor      │    │       Chat Sidebar             │ │
-│  │   (document editing)     │    │   - Send messages to agent     │ │
-│  │                          │    │   - See agent responses        │ │
-│  │                          │    │   - Agent status indicator     │ │
-│  └──────────────────────────┘    └────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────┘
-              │                                │
-              │ SuperDoc collaboration         │ WebSocket /chat/:roomId
-              │ (document sync)                │ (simple JSON messages)
-              ▼                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                  Collaboration Server (port 3050)                   │
-│                     Fastify + Yjs + WebSocket                       │
-│         /collaboration/:docId        /chat/:roomId                  │
-└─────────────────────────────────────────────────────────────────────┘
-              ▲                                ▲
-              │ SDK collaboration              │ WebSocket /chat/:roomId
-              │                                │
-┌─────────────────────────────────────────────────────────────────────┐
-│                         AI Agent (Node.js)                          │
-│  - Connects to document via SDK (client.open)                       │
-│  - Uses chooseTools() to get Document API tools                     │
-│  - Processes requests with OpenAI                                   │
-│  - Executes tools via dispatchSuperDocTool()                        │
-│  - Edits broadcast to all clients automatically                     │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    Client[Vue + SuperDoc client]
+    Server[Fastify collaboration and review server]
+    Agent[SuperDoc SDK review agent]
+    OpenAI[OpenAI]
+
+    Client <-->|Document and comment sync via WebSocket| Server
+    Client -->|Start review and poll progress via HTTP| Server
+    Server --> Agent
+    Agent -->|Generate revision and explanation| OpenAI
+    Agent -->|Reply and tracked revision| Server
 ```
 
-## Prerequisites
+## Requirements
 
-- **Node.js** 18+
-- **OpenAI API key**
+- Node.js 20 or newer
+- An OpenAI API key
 
-## Quick Start
+## First-time setup
 
-### 1. Install dependencies
+From the project directory, install all dependencies:
 
 ```bash
 npm run install:all
 ```
 
-### 2. Configure environment
+Create your local environment file:
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` and add your OpenAI API key:
+Open `.env` and replace the example value with your OpenAI API key:
 
-```
+```env
 OPENAI_API_KEY=sk-your-key-here
 ```
 
-### 3. Run the example
+## Run the demo
 
 ```bash
 npm run dev
 ```
 
-This starts:
-- **Collaboration server** on `http://localhost:3050`
-- **Vue client** on `http://localhost:5173`
-- **AI agent** connected to the same document
+Then open:
 
-### 4. Try it out
+**http://localhost:5173**
 
-1. Open `http://localhost:5173`
-2. Use the chat sidebar on the right to talk to the agent
-3. Try commands like:
-   - "Add a heading that says 'Introduction'"
-   - "Insert a paragraph about AI"
-   - "Make the first line bold"
-   - "What's in this document?"
+The command starts both the Vue client and the local collaboration/review server. The server runs on `http://localhost:3050`.
 
-## Project Structure
+## Try it
 
-```
-client/          Vue frontend with SuperDoc editor and chat sidebar
-server/          Fastify collaboration server with WebSocket endpoints
-agent/           AI agent with SDK integration and agentic loop
-```
+1. Select text in the document.
+2. Add a comment describing the change you want.
+3. Wait for the agent to review the new comment automatically.
+4. Review the agent's reply and tracked revision.
 
-## SDK Usage
+Use **Request Review** to process existing open comments. Use **Import** to load a DOCX file or **Blank document** to start fresh.
 
-### Connecting to a Document
-
-```typescript
-import { createSuperDocClient } from '@superdoc-dev/sdk';
-
-const client = createSuperDocClient();
-await client.connect();
-
-const doc = await client.open({
-  collaboration: {
-    providerType: 'y-websocket',
-    url: 'ws://localhost:3050/collaboration',
-    documentId: 'my-doc',
-  },
-});
-```
-
-### Getting Tools for LLM
-
-```typescript
-import { chooseTools } from '@superdoc-dev/sdk';
-
-const { tools } = await chooseTools({ provider: 'openai' });
-
-// tools is an array of OpenAI-compatible tool definitions
-```
-
-### Executing Tools
-
-```typescript
-import { dispatchSuperDocTool } from '@superdoc-dev/sdk';
-
-// Insert content at end of document
-await dispatchSuperDocTool(doc, 'insert_content', {
-  value: 'Hello, world!',
-  type: 'text',
-});
-
-// Get document text
-const result = await dispatchSuperDocTool(doc, 'get_document_text', {});
-```
-
-### Agentic Loop
-
-```typescript
-const MAX_ITERATIONS = 20;
-
-for (let i = 0; i < MAX_ITERATIONS; i++) {
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4.1',
-    messages,
-    tools,
-  });
-
-  const message = response.choices[0].message;
-
-  if (!message.tool_calls?.length) {
-    return message.content;  // Done
-  }
-
-  // Execute each tool call
-  for (const call of message.tool_calls) {
-    const args = JSON.parse(call.function.arguments);
-    const result = await dispatchSuperDocTool(doc, call.function.name, args);
-    messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) });
-  }
-}
-```
-
-## Available Scripts
-
-| Script | Description |
-|--------|-------------|
-| `npm run dev` | Run all components (server + client + agent) |
-| `npm run dev:server` | Run only the collaboration server |
-| `npm run dev:client` | Run only the Vue client |
-| `npm run dev:agent` | Run only the AI agent |
+Stop the demo with `Ctrl+C`.
 
 ## Troubleshooting
 
-### Agent shows "Offline"
-
-Make sure the agent is running. Check the terminal for errors. The agent needs a valid `OPENAI_API_KEY` in `.env`.
-
-### Edits not appearing
-
-Both client and agent connect to the same collaboration room. The SDK handles syncing edits automatically.
-
-## Learn More
-
-- [SuperDoc Documentation](https://docs.superdoc.dev)
-- [Document API SDK Reference](https://docs.superdoc.dev/document-api)
-- [Self-hosted Collaboration Guide](https://docs.superdoc.dev/guides/superdoc-yjs)
+- If the backend is unavailable, confirm both processes started and ports `3050` and `5173` are free.
+- If agent review fails, confirm `OPENAI_API_KEY` is set correctly in `.env`.
+- After changing `.env`, stop and restart `npm run dev`.
