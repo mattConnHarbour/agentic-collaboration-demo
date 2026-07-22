@@ -7,7 +7,7 @@ The user comments on selected text. The agent reads the comment, replies in the 
 ## Architecture
 
 ```mermaid
-flowchart LR
+flowchart TD
     Client[Vue + SuperDoc client]
     Server[Fastify collaboration and review server]
     Agent[SuperDoc SDK review agent]
